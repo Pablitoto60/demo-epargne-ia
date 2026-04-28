@@ -1,0 +1,24 @@
+# --- COMMANDES DEMO IA EPARGNE ---
+
+# Aller dans le dossier
+cd ~/demo-ia-epargne
+
+# Lister les fichiers
+ls
+
+# Ouvrir le code
+nano app.py
+
+# Sauvegarder dans nano
+Ctrl+O puis Entrée
+# Quitter nano
+Ctrl+X
+
+# Vérifier que le code Python compile
+python3 -m py_compile app.py
+
+# Lancer Streamlit
+python3 -m streamlit run app.py
+
+# Arrêter Streamlit
+Ctrl+C
