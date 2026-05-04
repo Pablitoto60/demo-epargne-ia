@@ -193,20 +193,11 @@ def render_chat():
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-    # --- CTA bouton souscription affiché en bas du chat (UI) ---
+    # --- CTA bouton projection affiché en bas du chat (UI) ---
     if st.session_state.show_subscribe_cta:
-        col_btn1, col_btn2 = st.columns([1, 1])
-
-        with col_btn1:
-            if st.button("✅ Souscrire en ligne", type="primary", key="btn_souscrire_chat"):
-                st.session_state.checkout_open = True
-                st.session_state.checkout_step = 1
-                st.rerun()
-
-        with col_btn2:
-            if st.button("❌ Pas maintenant", key="btn_pas_maintenant_chat"):
-                st.session_state.show_subscribe_cta = False
-                st.rerun()
+        if st.button("Afficher la projection", type="primary", key="btn_show_projection_chat"):
+            st.session_state.show_projection = True
+            st.rerun()
 
     # -----------------------------
     # Entrée utilisateur
@@ -316,7 +307,7 @@ def render_chat():
                 "2) Pour un horizon de plusieurs années, l'assurance vie est **flexible** (versements libres, retraits possibles).\n"
                 "3) Elle permet de viser un **potentiel de rendement** supérieur à un livret, en modulant le risque.\n\n"
                 "---\n\n"
-                "👉 **Étape suivante :** clique à droite sur **« Afficher la projection »** pour visualiser l'évolution estimée de ton épargne.\n"
+                "👉 **Étape suivante :** Clique sur **Afficher la projection** pour visualiser l'évolution estimée de ton épargne.\n"
             )
 
             # ✅ Animation dans le history_box
@@ -453,7 +444,7 @@ def render_right_panel():
 # --------------------------------------------------
 # Interface
 # --------------------------------------------------
-st.title("🤖 Démonstrateur – Agent IA de conseil épargne")
+st.header("Francis - Le robot épargne de Banque Populaire")
 mode_mobile = st.toggle("📱 Mode mobile", value=False)
 
 if not mode_mobile:
@@ -470,8 +461,9 @@ else:
     # 📱 MODE MOBILE
     render_chat()
 
-    st.divider()
+    if st.session_state.get("show_projection", False):
+        st.divider()
+        render_right_panel()
 
-    render_right_panel()
 
 
