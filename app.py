@@ -155,15 +155,25 @@ def render_chat():
     
     def assistant_type(container, text: str, delay: float = 0.06, chunk_words: int = 2):
         """Affiche le message assistant progressivement DANS container, puis l'ajoute à l'historique."""
+        import re
+
         with container:
             with st.chat_message("assistant"):
                 placeholder = st.empty()
-                words = text.split()
+                parts = re.split(r'(\s+)', text)
                 out = []
-                for i in range(0, len(words), chunk_words):
-                    out.extend(words[i:i + chunk_words])
-                    placeholder.markdown(" ".join(out))
-                    time.sleep(delay)
+                word_count = 0
+
+                for part in parts:
+                    out.append(part)
+                    if not part.isspace():
+                        word_count += 1
+                    if word_count > 0 and word_count % chunk_words == 0:
+                        placeholder.markdown("".join(out))
+                        time.sleep(delay)
+
+                # Affiche le reste du message si nécessaire
+                placeholder.markdown("".join(out))
 
         # Stocke le message complet dans l'historique
         st.session_state.messages.append({"role": "assistant", "content": text})
@@ -240,9 +250,13 @@ def render_chat():
         if step == 0:
             assistant_type(history_box,
                 "Excellente initiative. Je peux t’aider à continuer à épargner de façon simple et adaptée.\n\n"
-                f"D’après les informations dont je dispose, ton Livret A est déjà bien constitué ({KNOWN_PROFILE['livret_a_montant']} euros) — "
-                "c’est une très bonne chose : ça signifie que ton épargne de précaution est déjà en place.\n\n"
-                "Ce qu’il me manque maintenant, ce sont tes projets : qu’est-ce que tu aimerais préparer grâce à ton épargne ?"
+                "D’après les informations dont je dispose, voici ta situation actuelle :\n"
+                "- **Âge :** 28 ans\n"
+                "- **Situation :** salarié chez Decathlon\n"
+                "- **Revenu net mensuel :** 2 150 €\n"
+                "- **Livret A :** 22 950 €\n\n"
+                "C’est une très bonne base : ton épargne de précaution est déjà bien constituée.\n\n"
+                "**Qu’est-ce que tu aimerais préparer grâce à ton épargne ?**"
             )
             st.session_state.step = 1
             st.stop()
@@ -250,14 +264,14 @@ def render_chat():
         # Étape 1 : l'utilisateur répond son objectif/projet
         elif step == 1:
             client["objectif"] = user_text.strip()
-            assistant_type(history_box, "Merci, c’est clair.\n\nTu penses à quel horizon, à peu près ? (ex : 2 ans, 4–5 ans, 10 ans)")
+            assistant_type(history_box, "Merci, c’est clair.\n\n**Tu penses à quel horizon, à peu près ?** (ex : 2 ans, 4–5 ans, 10 ans)")
             st.session_state.step = 2
             st.stop()
 
         # Étape 2 : horizon
         elif step == 2:
             client["horizon"] = user_text.strip()
-            assistant_type(history_box, "Parfait.\n\nEt quel montant tu pourrais mettre de côté chaque mois, sans te mettre en difficulté ? (ex : 150€)")
+            assistant_type(history_box, "Parfait.\n\n**Quel montant pourrais-tu mettre de côté chaque mois, sans te mettre en difficulté ?** (ex : 150€)")
             st.session_state.step = 3
             st.stop()
 
@@ -266,12 +280,12 @@ def render_chat():
             m = extract_number(user_text)
             client["mensualite"] = m if m else 150
             assistant_type(history_box,
-                "Top.\n\nDernier point : le niveau de risque.\n"
+                "Top.\n\n**Dernier point : le niveau de risque.**\n\n"
                 "Si la valeur de ton épargne baisse temporairement, tu préfères plutôt :\n"
-                "• très prudent / sécuriser au maximum\n"
-                "• accepter de petites variations (équilibré)\n"
-                "• accepter plus de variations (dynamique)\n\n"
-                "Tu te situes plutôt où ?"
+                "- **Très prudent** / sécuriser au maximum\n"
+                "- **Équilibré** / accepter de petites variations\n"
+                "- **Dynamique** / accepter plus de variations\n\n"
+                "**Tu te situes plutôt où ?**"
             )
             st.session_state.step = 4
             st.stop()
