@@ -1,25 +1,128 @@
+import html as html_lib
 import streamlit as st
+import streamlit.components.v1 as components
 import numpy as np
 import plotly.graph_objects as go
 import time
+import re
+from openai import OpenAI
+from pathlib import Path
 
+def inject_devices_css():
+    css = Path("assets/devices.min.css").read_text(encoding="utf-8")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 # --------------------------------------------------
-# Configuration de la page
+# Configuration
 # --------------------------------------------------
 st.set_page_config(page_title="Démo IA – Conseil Épargne", layout="wide")
 
-# --------------------------------------------------
-# Hypothèses du démonstrateur (illustratives)
-# --------------------------------------------------
+KNOWN_PROFILE = {
+    "prenom": "Pablo",
+    "age": 28,
+    "situation": "Salarié chez Decathlon",
+    "revenu_net_mensuel": 2150,
+    "livret_a": 22950
+}
+
 HORIZON_ANNEES = 10
 MOIS = HORIZON_ANNEES * 12
-VERSEMENT_MENSUEL = 150  # € par mois
 
 RENDEMENTS = {
-    "Sécurisé": 0.020,    # 2,0 % / an
-    "Équilibré": 0.050,   # 5,0 % / an
-    "Dynamique": 0.080    # 8,0 % / an
+    "Sécurisé": 0.020,
+    "Équilibré": 0.050,
+    "Dynamique": 0.080
 }
+
+# --------------------------------------------------
+# OpenAI Client (cached)
+# --------------------------------------------------
+@st.cache_resource
+def get_openai_client():
+    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+def call_llm(history, context):
+    """Appelle OpenAI pour générer une réponse."""
+    client = get_openai_client()
+    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+    
+    messages = [
+        {"role": "system", "content": (
+            "Tu es Francis, le robot conseiller épargne de Banque Populaire. "
+            "Ton ton est rassurant, clair et bienveillant. "
+            "Tu es non contractuel : ne promets jamais de rendement. "
+            "Pose UNE question à la fois si une info manque. "
+            "Demande les infos dans cet ordre : objectif, horizon, mensualité, puis risque. "
+            "Ne donne pas de recommandation avant d'avoir toutes ces informations. "
+            "Utilise le markdown : **gras** pour les titres, - pour les puces.\n\n"
+            "Le profil client a déjà été présenté. Ne le répète jamais. "
+            "Si tu as besoin de ces données, considère-les comme déjà connues et passe à la question suivante.\n\n"
+            f"Contexte métier :\n{context}"
+        )}
+    ] + history
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.4,
+        max_tokens=600
+    )
+    return response.choices[0].message.content.strip()
+
+# --------------------------------------------------
+# Extracteurs d'info
+# --------------------------------------------------
+def extract_montant(text):
+    """Extrait un montant (nombre) du texte."""
+    m = re.search(r"(\d+)", text.replace(" ", ""))
+    return int(m.group(1)) if m else None
+
+def extract_risque(text):
+    """Extrait le niveau de risque du texte."""
+    t = text.lower()
+    if any(w in t for w in ["sécur", "secur", "prudent", "conservat", "faible"]):
+        return "Sécurisé"
+    if any(w in t for w in ["dyna", "agressif", "élevé", "elevé", "fort"]):
+        return "Dynamique"
+    if any(w in t for w in ["équil", "equil", "moyen", "modéré", "moderate"]):
+        return "Équilibré"
+    return None
+
+def get_missing_slots(client):
+    """Retourne la liste des slots manquants."""
+    missing = []
+    if not client.get("objectif"): missing.append("objectif")
+    if not client.get("horizon"): missing.append("horizon")
+    if not client.get("mensualite"): missing.append("mensualite")
+    if not client.get("risque"): missing.append("risque")
+    return missing
+
+def extract_info_from_user_input(user_text, client):
+    """Essaye d'extraire plusieurs infos du message utilisateur."""
+    # Extraction des nombres (montant mensuel)
+    montant = extract_montant(user_text)
+    if montant and not client.get("mensualite"):
+        client["mensualite"] = montant
+    
+    # Extraction du risque
+    risque = extract_risque(user_text)
+    if risque and not client.get("risque"):
+        client["risque"] = risque
+    
+    # Horizon simple (ex: "2 ans", "3 à 5 ans")
+    if not client.get("horizon"):
+        horizon_patterns = [
+            r"(\d+)\s*(?:à|-)\s*(\d+)\s*ans?",
+            r"(\d+)\s*ans?"
+        ]
+        for pattern in horizon_patterns:
+            match = re.search(pattern, user_text.lower())
+            if match:
+                client["horizon"] = user_text[match.start():match.end()]
+                break
+    
+    # Si aucun slot n'a été rempli, le texte entier est considéré comme objectif/réponse libre
+    if not montant and not risque and not client.get("horizon") and not client.get("objectif"):
+        client["objectif"] = user_text.strip()
 
 # --------------------------------------------------
 # Fonctions de calcul
@@ -33,62 +136,47 @@ def projection_epargne(versement_mensuel, rendement_annuel, mois):
 
 def build_chart(risque, versement_mensuel):
     x = np.arange(MOIS + 1) / 12
-
-    # Total (capital estimé)
     total = projection_epargne(versement_mensuel, RENDEMENTS[risque], MOIS)
-
-    # Versements cumulés (sans performance)
     versements = np.arange(MOIS + 1) * versement_mensuel
-
-    # Gain estimé
     gain = total - versements
 
     fig = go.Figure()
 
-    # 1) Zone Versements cumulés
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=versements,
-            mode="lines",
-            name="Versements cumulés",
-            line=dict(color="rgba(107,114,128,1)", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(107,114,128,0.15)",
-            hovertemplate="Années: %{x:.1f}<br>Versements: %{y:,.0f} €<extra></extra>".replace(",", " ")
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=x, y=versements,
+        mode="lines",
+        name="Versements cumulés",
+        line=dict(color="rgba(107,114,128,1)", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(107,114,128,0.15)",
+        hovertemplate="Années: %{x:.1f}<br>Versements: %{y:,.0f} €<extra></extra>".replace(",", " ")
+    ))
 
-    # 2) Zone Gain estimé (fill entre versements et total)
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=total,
-            mode="lines",
-            name="Gain estimé",
-            line=dict(color="rgba(16,185,129,0)", width=0),  # ligne invisible
-            fill="tonexty",
-            fillcolor="rgba(16,185,129,0.18)",
-            hovertemplate="Années: %{x:.1f}<br>Gain estimé: %{customdata:,.0f} €<extra></extra>".replace(",", " "),
-            customdata=gain
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=x, y=total,
+        mode="lines",
+        name="Gain estimé",
+        line=dict(color="rgba(16,185,129,0)", width=0),
+        fill="tonexty",
+        fillcolor="rgba(16,185,129,0.18)",
+        hovertemplate="Années: %{x:.1f}<br>Gain estimé: %{customdata:,.0f} €<extra></extra>".replace(",", " "),
+        customdata=gain
+    ))
 
-    # 3) Ligne Capital estimé (au-dessus)
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=total,
-            mode="lines",
-            name="Capital estimé",
-            line=dict(color="#2563EB", width=4),
-            hovertemplate=(
-                "Années: %{x:.1f}<br>"
-                "Capital: %{y:,.0f} €<br>"
-                "Versements: %{customdata[0]:,.0f} €<br>"
-                "Gain estimé: %{customdata[1]:,.0f} €"
-                "<extra></extra>"
-            ).replace(",", " "),
-            customdata=np.column_stack([versements, gain])
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=x, y=total,
+        mode="lines",
+        name="Capital estimé",
+        line=dict(color="#2563EB", width=4),
+        hovertemplate=(
+            "Années: %{x:.1f}<br>"
+            "Capital: %{y:,.0f} €<br>"
+            "Versements: %{customdata[0]:,.0f} €<br>"
+            "Gain estimé: %{customdata[1]:,.0f} €"
+            "<extra></extra>"
+        ).replace(",", " "),
+        customdata=np.column_stack([versements, gain])
+    ))
 
     fig.update_layout(
         title=f"Évolution projetée — Profil {risque} (illustratif)",
@@ -112,372 +200,337 @@ def build_chart(risque, versement_mensuel):
 
     return fig
 
-def render_chat():
-    st.subheader("Conversation")
+# --------------------------------------------------
+# UI Components
+# --------------------------------------------------
 
-    # -----------------------------
-    # Connaissance déjà disponible (fictif)
-    # -----------------------------
-    KNOWN_PROFILE = {
-        "prenom": "Pablo",
-        "age": 28,
-        "revenu_net_mensuel": 2400,
-        "livret_a_plein": True,
-        "livret_a_montant": 22950
-    }
+def display_client_slots():
+    """Affiche les slots du client remplis jusqu'à présent."""
+    client = st.session_state.get("client", {})
+    missing = get_missing_slots(client)
+    
+    if missing:
+        st.caption(f"ℹ️ Infos manquantes: {', '.join(missing)}")
+    else:
+        st.caption("✅ Toutes les infos sont disponibles!")
 
-    # -----------------------------
-    # Mémoire de conversation    # -----------------------------
+def assistant_type(container, text: str, delay: float = 0.06, chunk_words: int = 2):
+    """Affiche le message assistant progressivement."""
+    with container:
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            parts = re.split(r'(\s+)', text)
+            out = []
+            word_count = 0
+
+            for part in parts:
+                out.append(part)
+                if not part.isspace():
+                    word_count += 1
+                if word_count > 0 and word_count % chunk_words == 0:
+                    placeholder.markdown("".join(out))
+                    time.sleep(delay)
+
+            placeholder.markdown("".join(out))
+
+    st.session_state.messages.append({"role": "assistant", "content": text})
+
+def render_desktop_chat():
+    """Mode desktop avec 2 colonnes."""
+    col_left, col_right = st.columns([1, 1], gap="large")
+    
+    with col_left:
+        st.subheader("💬 Conversation")
+        render_chat_core()
+    
+    with col_right:
+        st.subheader("📊 Projection")
+        render_projection_panel()
+
+
+def render_chat_core():
+    """Cœur du chat (réutilisable desktop/mobile)."""
+    # Init session
     if "messages" not in st.session_state:
-        st.session_state.messages = [
-        {"role": "assistant", "content": (
-            "Bonjour Pablo 👋\n\n"
-            "Je suis **Francis**, le robot de **Banque Populaire**.\n"
-            "Je suis là pour t’accompagner pas à pas dans la préparation de ton épargne, en toute simplicité.\n\n"
-            "Mon objectif est de t’aider à y voir clair, à comprendre tes options, "
-            "et à te proposer des solutions adaptées à ta situation et à tes projets.\n\n"
-            "Explique-moi ce que tu aimerais faire ou ce qui t’interroge."
-       )}
-    ]
-
-        st.session_state.step = 0
-        st.session_state.show_subscribe_cta = False
+        st.session_state.messages = [{
+            "role": "assistant",
+            "content": f"Bonjour {KNOWN_PROFILE['prenom']} 👋\n\nJe suis **Francis**, le robot de **Banque Populaire**.\n\nJe vais te poser quelques questions pour te conseiller de manière adaptée. Commençons!\n\n**Qu'est-ce que tu aimerais préparer grâce à ton épargne ?** (ex: achat immobilier, projet de voyage, fonds d'urgence…)"
+        }]
+    
+    if "client" not in st.session_state:
         st.session_state.client = {
-            "pourquoi": None,
             "objectif": None,
             "horizon": None,
             "mensualite": None,
             "risque": None
         }
-
-    def assistant_say(text: str):
-        st.session_state.messages.append({"role": "assistant", "content": text})
     
-    def assistant_type(container, text: str, delay: float = 0.06, chunk_words: int = 2):
-        """Affiche le message assistant progressivement DANS container, puis l'ajoute à l'historique."""
-        import re
-
-        with container:
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                parts = re.split(r'(\s+)', text)
-                out = []
-                word_count = 0
-
-                for part in parts:
-                    out.append(part)
-                    if not part.isspace():
-                        word_count += 1
-                    if word_count > 0 and word_count % chunk_words == 0:
-                        placeholder.markdown("".join(out))
-                        time.sleep(delay)
-
-                # Affiche le reste du message si nécessaire
-                placeholder.markdown("".join(out))
-
-        # Stocke le message complet dans l'historique
-        st.session_state.messages.append({"role": "assistant", "content": text})
-
-    def normalize_risk(text: str):
-        t = text.lower()
-        if "sécur" in t or "secur" in t or "prudent" in t:
-            return "Sécurisé"
-        if "dyna" in t or "risqu" in t:
-            return "Dynamique"
-        if "équil" in t or "equil" in t or "moyen" in t:
-            return "Équilibré"
-        return None
-
-    def extract_number(text: str):
-        import re
-        m = re.search(r"(\d+)", text.replace(" ", ""))
-        return int(m.group(1)) if m else None
-
-    # -----------------------------
-    # Zone scrollable : historique (style Copilot)
-    # -----------------------------
+    if "can_show_projection" not in st.session_state:
+        st.session_state.can_show_projection = False
+    
+    if "show_projection" not in st.session_state:
+        st.session_state.show_projection = False
+    
+    if "use_llm" not in st.session_state:
+        st.session_state.use_llm = False
+    
+    # Affichage des messages
     history_box = st.container(height=520, border=True)
-
     with history_box:
         for m in st.session_state.messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
-
-    # --- CTA bouton projection affiché en bas du chat (UI) ---
-    if st.session_state.show_subscribe_cta:
-        if st.button("Afficher la projection", type="primary", key="btn_show_projection_chat"):
+    
+    # Affichage des slots
+    display_client_slots()
+    
+    # Bouton reset
+    if st.button("↺ Recommencer", key="btn_reset"):
+        for key in ["messages", "client", "can_show_projection", "show_projection", "risque_ui", "checkout_open", "checkout_step"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
+    
+    # Input utilisateur
+    user_text = st.chat_input("Tape ton message…")
+    if user_text:
+        handle_user_input(user_text)
+        st.rerun()
+    
+    # Bouton projection (desktop)
+    if st.session_state.get("can_show_projection", False) and not st.session_state.get("show_projection", False):
+        if st.button("📊 Afficher la projection", type="primary", use_container_width=True):
             st.session_state.show_projection = True
             st.rerun()
 
-    # -----------------------------
-    # Entrée utilisateur
-    # -----------------------------
+def handle_user_input(user_text):
+    """Traite l'entrée utilisateur: extraction, LLM, état."""
+    # Ajoute le message utilisateur
+    st.session_state.messages.append({"role": "user", "content": user_text})
     
-    # --- Reset discret (en bas à gauche, juste au-dessus de la saisie) ---
-    left_reset, _ = st.columns([1, 10])
-    with left_reset:
-        if st.button("↺", key="btn_reset_demo", help="Recommencer la conversation"):
-            keys_to_reset = [
-                "messages", "step", "client",
-                "can_show_projection", "show_projection", "risque_ui",
-                "checkout_open", "checkout_step",
-                "right_panel", "show_subscribe_cta"
-            ]
-            for k in keys_to_reset:
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.rerun()
+    client = st.session_state.client
+    
+    # Extraction intelligente
+    extract_info_from_user_input(user_text, client)
+    
+    # Détecte si toutes les infos sont remplies
+    if all([client.get("objectif"), client.get("horizon"), client.get("mensualite"), client.get("risque")]):
+        st.session_state.can_show_projection = True
+    
+    # Build context
+    context = f"""
+État client actuel :
+- Objectif: {client.get('objectif', 'Non défini')}
+- Horizon: {client.get('horizon', 'Non défini')}
+- Mensualité: {client.get('mensualite', 'Non défini')} €
+- Risque: {client.get('risque', 'Non défini')}
 
-    user_text = st.chat_input("Tape ton message…")
-    if user_text:
-        # 1) Stocke le message utilisateur
-        st.session_state.messages.append({"role": "user", "content": user_text})
+Slots manquants: {', '.join(get_missing_slots(client)) or 'aucun'}
 
-        # 2) Affiche immédiatement le message dans l'historique (sans attendre un rerun)
-        with history_box:
-            with st.chat_message("user"):
-                st.markdown(user_text)
+Règles :
+- Pose UNE question à la fois pour les infos manquantes.
+- Si toutes les infos sont définies, recommande Assurance vie adaptée au risque.
+"""
+    
+    # Choix du mode conversation
+    if st.session_state.get("use_llm", False):
+        try:
+            assistant_reply = call_llm(st.session_state.messages, context)
+        except Exception as e:
+            assistant_reply = None
+    else:
+        assistant_reply = None
 
-        # 3) Puis continue ta logique step (et le bot peut taper dans history_box)
-        step = st.session_state.step
-        client = st.session_state.client
-
-    # ... if step == 0 / elif ... etc ...
-        step = st.session_state.step
-        client = st.session_state.client
-
-        # Étape 0 : accueil + demande du projet
-        if step == 0:
-            assistant_type(history_box,
-                "Excellente initiative. Je peux t’aider à continuer à épargner de façon simple et adaptée.\n\n"
-                "D’après les informations dont je dispose, voici ta situation actuelle :\n"
-                "- **Âge :** 28 ans\n"
-                "- **Situation :** salarié chez Decathlon\n"
-                "- **Revenu net mensuel :** 2 150 €\n"
-                "- **Livret A :** 22 950 €\n\n"
-                "C’est une très bonne base : ton épargne de précaution est déjà bien constituée.\n\n"
-                "**Qu’est-ce que tu aimerais préparer grâce à ton épargne ?**"
-            )
-            st.session_state.step = 1
-            st.stop()
-
-        # Étape 1 : l'utilisateur répond son objectif/projet
-        elif step == 1:
-            client["objectif"] = user_text.strip()
-            assistant_type(history_box, "Merci, c’est clair.\n\n**Tu penses à quel horizon, à peu près ?** (ex : 2 ans, 4–5 ans, 10 ans)")
-            st.session_state.step = 2
-            st.stop()
-
-        # Étape 2 : horizon
-        elif step == 2:
-            client["horizon"] = user_text.strip()
-            assistant_type(history_box, "Parfait.\n\n**Quel montant pourrais-tu mettre de côté chaque mois, sans te mettre en difficulté ?** (ex : 150€)")
-            st.session_state.step = 3
-            st.stop()
-
-        # Étape 3 : mensualité
-        elif step == 3:
-            m = extract_number(user_text)
-            client["mensualite"] = m if m else 150
-            assistant_type(history_box,
-                "Top.\n\n**Dernier point : le niveau de risque.**\n\n"
-                "Si la valeur de ton épargne baisse temporairement, tu préfères plutôt :\n"
-                "- **Très prudent** / sécuriser au maximum\n"
-                "- **Équilibré** / accepter de petites variations\n"
-                "- **Dynamique** / accepter plus de variations\n\n"
-                "**Tu te situes plutôt où ?**"
-            )
-            st.session_state.step = 4
-            st.stop()
-
-        # Étape 4 : risque + recommandation + déclenche projection
-        elif step == 4:
-            r = normalize_risk(user_text) or "Équilibré"
-            client["risque"] = r
-
-            st.session_state.risque_ui = r
-            st.session_state.can_show_projection = True
-            st.session_state.show_projection = False
-
-            prenom = KNOWN_PROFILE["prenom"]
-            mensualite = client.get("mensualite") or 150
-            horizon = client.get("horizon") or "—"
-            objectif = client.get("objectif") or "—"
-
-            reco_text = (
-                " ✅ Recommandation\n\n"
-
-                f"**Merci {prenom} !** Voilà ce que je te propose au regard de ton projet.\n\n"
-                "**Synthèse**\n"
-                f"- **Projet :** {objectif}\n"
-                f"- **Horizon :** {horizon}\n"
-                f"- **Effort d'epargne :** {mensualite} € / mois\n"
-                f"- **Profil :** {client['risque']}\n\n"
-                "---\n\n"
-                " 🎯 Produit recommandé : **Assurance vie**\n"
-                f"Une assurance vie avec un profil **{client['risque'].lower()}** (ajustable dans le temps).\n\n"
-                "**Pourquoi c'est adapté :**\n"
-                "1) Ton **Livret A** couvre déjà l'épargne de précaution → on le conserve pour les imprévus.\n"
-                "2) Pour un horizon de plusieurs années, l'assurance vie est **flexible** (versements libres, retraits possibles).\n"
-                "3) Elle permet de viser un **potentiel de rendement** supérieur à un livret, en modulant le risque.\n\n"
-                "---\n\n"
-                "👉 **Étape suivante :** Clique sur **Afficher la projection** pour visualiser l'évolution estimée de ton épargne.\n"
-            )
-
-            # ✅ Animation dans le history_box
-            assistant_type(history_box, reco_text, delay=0.06, chunk_words=2)
-
-            st.session_state.show_subscribe_cta = True
-            st.session_state.step = 5
-
-            # IMPORTANT : à cette étape, tu veux que le panneau de droite affiche le bouton projection
-            st.rerun()
-
-       
-        # Étape 5 : après reco (ajustements / souscription)
+    if assistant_reply is None:
+        missing = get_missing_slots(client)
+        if "objectif" in missing:
+            assistant_reply = "Qu'est-ce que tu aimerais préparer grâce à ton épargne ?"
+        elif "horizon" in missing:
+            assistant_reply = "À quel horizon tu envisages cela ? (ex: 2 ans, 5 ans, 10 ans)"
+        elif "mensualite" in missing:
+            assistant_reply = "Quel montant peux-tu mettre de côté chaque mois ? (ex: 150€)"
+        elif "risque" in missing:
+            assistant_reply = "Quel est ton profil de risque ?\n- **Sécurisé** (faible risque)\n- **Équilibré** (risque modéré)\n- **Dynamique** (plus de risque)"
         else:
-            txt = user_text.lower()
-            if "souscri" in txt or "ouvrir" in txt or "oui" in txt or "ok" in txt:
-                assistant_type("Parfait 👍 Clique sur **Souscrire en ligne**.")
-                st.session_state.show_subscribe_cta = True
-            else:
-                assistant_type(history_box,
-                    "Très bien. Dis-moi ce que tu veux ajuster :\n"
-                    "• le montant mensuel (ex : 200€)\n"
-                    "• l’horizon (ex : 3 ans)\n"
-                    "• ou le niveau de risque (sécurisé / équilibré / dynamique)\n\n"
-                    "Et je mets à jour la projection."
-                    )
-            st.stop()
+            assistant_reply = (
+                f"✅ **Recommandation**\n\n"
+                f"Basé sur ton profil, je te recommande une **Assurance vie** avec un profil **{client.get('risque', 'Équilibré').lower()}**.\n\n"
+                "Clique sur **Voir la projection** pour visualiser l'évolution estimée."
+            )
+            st.session_state.can_show_projection = True
+    
+    # Détection de recommandation
+    if "recommand" in assistant_reply.lower() or "assurance vie" in assistant_reply.lower():
+        st.session_state.can_show_projection = True
+    
+    # Affiche la réponse avec effet de typing
+    history_box = st.container(height=520, border=True)
+    assistant_type(history_box, assistant_reply)
 
-def render_right_panel():
-# ----- Colonne droite : graphique
-# ----- Colonne droite : projection / souscription
-    st.subheader("Projection / Souscription")
+def render_projection_panel():
+    """Panel de projection."""
+    if not st.session_state.get("can_show_projection", False):
+        st.info("ℹ️ Complète d'abord le questionnaire pour voir la projection.")
+        return
+    
+    if not st.session_state.get("show_projection", False):
+        if st.button("📊 Afficher la projection", type="primary", use_container_width=True):
+            st.session_state.show_projection = True
+            st.rerun()
+    else:
+        client = st.session_state.client
+        risque = st.selectbox(
+            "Profil de risque",
+            ["Sécurisé", "Équilibré", "Dynamique"],
+            index=["Sécurisé", "Équilibré", "Dynamique"].index(client.get("risque", "Équilibré")),
+            key="risque_select"
+        )
+        
+        mensu = client.get("mensualite", 150)
+        st.plotly_chart(build_chart(risque, mensu), use_container_width=True)
+        
+        if st.button("✅ Souscrire en ligne", type="primary", use_container_width=True):
+            st.success("Redirection vers le tunnel de souscription... (démo)")
 
-    # Valeurs par défaut pour l'état
+def render_mobile_iphone():
+    """Rendu mobile dans une frame iPhone avec chat HTML à l'intérieur."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{
+            "role": "assistant",
+            "content": (
+                f"Bonjour {KNOWN_PROFILE['prenom']} 👋\n\n"
+                "Je suis **Francis**, le robot de **Banque Populaire**.\n\n"
+                "Je vais te poser quelques questions pour te conseiller de manière adaptée. Commençons !\n\n"
+                "**Qu'est-ce que tu aimerais préparer grâce à ton épargne ?** (ex: achat immobilier, projet de voyage, fonds d'urgence…)")
+        }]
+    if "client" not in st.session_state:
+        st.session_state.client = {
+            "objectif": None,
+            "horizon": None,
+            "mensualite": None,
+            "risque": None
+        }
     if "can_show_projection" not in st.session_state:
         st.session_state.can_show_projection = False
     if "show_projection" not in st.session_state:
         st.session_state.show_projection = False
-    if "risque_ui" not in st.session_state:
-        st.session_state.risque_ui = "Équilibré"
 
-    if "checkout_open" not in st.session_state:
-        st.session_state.checkout_open = False
-    if "checkout_step" not in st.session_state:
-        st.session_state.checkout_step = 1
+    inject_devices_css()
 
-    # =========================================================
-    # 1) MODE SOUSCRIPTION : remplace le graphique
-    # =========================================================
-    if st.session_state.checkout_open:
-        st.subheader("Souscription en ligne — Démo")
-        st.caption("Écran interne simulant un parcours de souscription. Aucune donnée n’est transmise.")
+    def build_chat_html(messages, can_show_projection):
+        escaped_messages = []
+        for m in messages:
+            role = m.get("role", "assistant")
+            cls = "user" if role == "user" else "assistant"
+            content = html_lib.escape(m.get("content", "")).replace("\n", "<br>")
+            escaped_messages.append(
+                f"<div class='bubble {cls}'>{content}</div>"
+            )
 
-        # Récupérer infos “pré-remplies”
-        mensu = 150
-        objectif = "—"
-        horizon = "—"
-        if "client" in st.session_state and isinstance(st.session_state.client, dict):
-            mensu = st.session_state.client.get("mensualite") or 150
-            mensu = int(mensu)
-            objectif = st.session_state.client.get("objectif") or "—"
-            horizon = st.session_state.client.get("horizon") or "—"
-        risque = st.session_state.get("risque_ui", "Équilibré")
+        projection_label = "Voir la projection" if can_show_projection else "Voir la projection"
+        projection_style = "button-enabled" if can_show_projection else "button-disabled"
 
-        st.info("Démo : ceci simule le tunnel. Dans un vrai parcours : KYC, documents, signature, etc.")
+        return f"""
+        <style>
+          .device-wrap {{ display:flex; justify-content:center; padding:18px 0; }}
+          .phone-screen {{ height: 820px; display:flex; flex-direction:column; background:#fff; }}
+          .statusbar {{ display:flex; justify-content:space-between; font-size:11px; color:#666; padding:8px 12px; border-bottom:1px solid #eee; }}
+          .phone-messages {{ flex:1; overflow-y:auto; padding:12px 14px; background:#f5f7fa; }}
+          .bubble {{ max-width:82%; padding:12px 14px; border-radius:20px; margin:8px 0; line-height:1.45; font-size:14px; word-break:break-word; }}
+          .bubble.user {{ margin-left:auto; background:#2563eb; color:#fff; border-top-right-radius:6px; }}
+          .bubble.assistant {{ margin-right:auto; background:#f3f4f6; color:#111827; border-top-left-radius:6px; }}
+          .phone-footer {{ border-top:1px solid #eee; padding:10px 14px; background:#fff; flex-shrink:0; }}
+          .phone-footer .hint {{ color:#6b7280; font-size:12px; margin-bottom:8px; }}
+          .phone-controls {{ display:flex; gap:8px; margin-top:10px; }}
+          .phone-button {{ flex:1; border-radius:14px; padding:11px 0; font-weight:700; text-align:center; font-size:13px; }}
+          .button-enabled {{ background:#2563eb; color:#fff; }}
+          .button-disabled {{ background:#e5e7eb; color:#9ca3af; }}
+          .phone-home {{ height:36px; background:#f7f7f7; border-top:1px solid #eee; display:flex; align-items:center; justify-content:center; }}
+          .home-bar {{ width:120px; height:4px; background:#000; border-radius:999px; }}
+        </style>
+        <div class='device-wrap'>
+          <div class='device device-iphone-14-pro device-spaceblack'>
+            <div class='device-frame'>
+              <div class='device-screen'>
+                <div class='phone-screen'>
+                  <div class='statusbar'>
+                    <span>9:41</span><span>BP</span><span>📶 🔋</span>
+                  </div>
+                  <div class='phone-messages'>
+                    {''.join(escaped_messages)}
+                  </div>
+                  <div class='phone-footer'>
+                    <div class='hint'>Tape ton message dans le champ Streamlit ci-dessous.</div>
+                    <div class='phone-controls'>
+                      <div class='phone-button {projection_style}'>{projection_label}</div>
+                      <div class='phone-button button-enabled'>Contacter</div>
+                    </div>
+                  </div>
+                  <div class='phone-home'><div class='home-bar'></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
 
-        # Etape 1
-        if st.session_state.checkout_step == 1:
-            st.markdown("### Récapitulatif")
-            st.write("**Produit :** Assurance vie")
-            st.write("**Profil :**", risque)
-            st.write("**Versement mensuel :**", f"{mensu} €")
-            st.write("**Objectif :**", objectif)
-            st.write("**Horizon :**", horizon)
+    components.html(
+        build_chat_html(st.session_state.messages, st.session_state.get("can_show_projection", False)),
+        height=860,
+        scrolling=True
+    )
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("⬅️ Retour à la projection", key="btn_back_to_projection"):
-                    st.session_state.checkout_open = False
-                    st.session_state.checkout_step = 1
-                    st.rerun()
-            with col2:
-                if st.button("✅ Continuer", type="primary", key="btn_checkout_continue"):
-                    st.session_state.checkout_step = 2
-                    st.rerun()
+    st.markdown("<div style='max-width:390px;margin:18px auto 4px auto;'>", unsafe_allow_html=True)
+    user_text = st.text_input("Tape ton message…", key="mobile_input")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        # Etape 2
-        elif st.session_state.checkout_step == 2:
-            st.success("Souscription confirmée ✅ (démo)")
-            st.caption("Dans un vrai parcours : validation, signature électronique, confirmation…")
+    if user_text:
+        handle_user_input(user_text)
+        st.session_state.mobile_input = ""
+        st.rerun()
 
-            if st.button("Terminer", type="primary", key="btn_checkout_finish"):
-                st.session_state.checkout_open = False
-                st.session_state.checkout_step = 1
-                st.rerun()
-
-    # =========================================================
-    # 2) MODE PROJECTION : affiché si checkout_open == False
-    # =========================================================
-    else:
-        # Tant que la reco n'a pas été faite : on n'affiche pas le graphique
-        if not st.session_state.can_show_projection:
-            st.info("La projection s’affichera après la recommandation produit.")
-        else:
-            # Bouton pour afficher la projection au moment de la reco
-            if not st.session_state.show_projection:
-                if st.button("Afficher la projection", type="primary", key="btn_show_projection"):
-                    st.session_state.show_projection = True
-                    st.rerun()
-
-            # Une fois le bouton cliqué : on affiche le risque + le graphique
-            if st.session_state.show_projection:
-                risque = st.selectbox(
-                    "Niveau de risque",
-                    ["Sécurisé", "Équilibré", "Dynamique"],
-                    index=["Sécurisé", "Équilibré", "Dynamique"].index(st.session_state.risque_ui),
-                    key="risque_select"
-                )
-                st.session_state.risque_ui = risque
-                
-                mensu = 150
-                if "client" in st.session_state and isinstance(st.session_state.client, dict):
-                    mensu = st.session_state.client.get("mensualite") or 150
-                
-                st.plotly_chart(build_chart(risque, mensu), use_container_width=True)
-
-                # Bouton souscription (démo) -> bascule vers l'écran interne
-                if st.button("✅ Souscrire en ligne", type="primary", key="btn_souscrire"):
-                    st.session_state.checkout_open = True
-                    st.session_state.checkout_step = 1
-                    st.rerun()
-
-
-# --------------------------------------------------
-# Interface
-# --------------------------------------------------
-st.header("Francis - Le robot épargne de Banque Populaire")
-mode_mobile = st.toggle("📱 Mode mobile", value=False)
-
-if not mode_mobile:
-    # 🖥️ MODE DESKTOP
-    col_gauche, col_droite = st.columns([1, 1], gap="large")
-
-    with col_gauche:
-        render_chat()
-
-    with col_droite:
-        render_right_panel()
-
-else:
-    # 📱 MODE MOBILE
-    render_chat()
+    can_show = st.session_state.get("can_show_projection", False)
+    col1, col2 = st.columns(2, gap="small")
+    with col1:
+        if st.button("📊 Afficher la projection", disabled=not can_show, use_container_width=True, key="mobile_proj"):
+            st.session_state.show_projection = True
+            st.rerun()
+    with col2:
+        if st.button("📞 Contacter mon conseiller", use_container_width=True, key="mobile_advisor"):
+            st.toast("Conseiller", icon="✅")
 
     if st.session_state.get("show_projection", False):
         st.divider()
-        render_right_panel()
+        st.subheader("📊 Projection")
+        client = st.session_state.client
+        risque = st.selectbox(
+            "Profil de risque",
+            ["Sécurisé", "Équilibré", "Dynamique"],
+            index=["Sécurisé", "Équilibré", "Dynamique"].index(client.get("risque", "Équilibré")),
+            key="mobile_risque"
+        )
+        mensu = client.get("mensualite", 150)
+        st.plotly_chart(build_chart(risque, mensu), use_container_width=True)
 
+# ==================================================
+# MAIN UI (Interface principale)
+# ==================================================
+st.header("Francis - Robot épargne Banque Populaire")
 
+st.divider()
 
+# Mode de conversation (pré-remplissage vs LLM)
+use_llm = st.checkbox(
+    "Activer le mode LLM",
+    value=st.session_state.get("use_llm", False),
+    help="Quand activé, les réponses peuvent être générées par l'IA. Sinon, le flux reste en mode conversation pré-remplie."
+)
+st.session_state.use_llm = use_llm
+
+# Toggle mode mobile
+mode_mobile = st.toggle("📱 Mode mobile iPhone", value=False)
+
+if mode_mobile:
+    render_mobile_iphone()
+else:
+    render_desktop_chat()
