@@ -1,25 +1,20 @@
-import html as html_lib
 import streamlit as st
-import streamlit.components.v1 as components
 import numpy as np
 import plotly.graph_objects as go
 import time
 import re
 from openai import OpenAI
-from pathlib import Path
 
-def inject_devices_css():
-    css = Path("assets/devices.min.css").read_text(encoding="utf-8")
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
 st.set_page_config(page_title="Démo IA – Conseil Épargne", layout="wide")
 
 KNOWN_PROFILE = {
-    "prenom": "Pablo",
+    "prenom": "Laura",
     "age": 28,
-    "situation": "Salarié chez Decathlon",
+    "situation": "Salariée chez Decathlon",
     "revenu_net_mensuel": 2150,
     "livret_a": 22950
 }
@@ -48,12 +43,20 @@ def call_llm(history, context):
     messages = [
         {"role": "system", "content": (
             "Tu es Francis, le robot conseiller épargne de Banque Populaire. "
-            "Ton ton est rassurant, clair et bienveillant. "
+            "Ton ton est **dynamique, actif et proactif** - tu es un cadre enthousiaste qui croit aux projets de ses clients. "
+            "Tu es **descriptif** : explique pourquoi chaque question est importante et donne du contexte. "
             "Tu es non contractuel : ne promets jamais de rendement. "
             "Pose UNE question à la fois si une info manque. "
             "Demande les infos dans cet ordre : objectif, horizon, mensualité, puis risque. "
-            "Ne donne pas de recommandation avant d'avoir toutes ces informations. "
-            "Utilise le markdown : **gras** pour les titres, - pour les puces.\n\n"
+            "⚠️ **IMPORTANT** : Pose AU MOINS 4 questions avant de faire une recommandation (même si toutes les infos semblent remplies). "
+            "Ne saute pas d'étapes, pose chaque question avec enthousiasme. "
+            "Quand tu donnes une recommandation, structure-la en sections comme suit :\n"
+            "- ✅ Recommandation\n"
+            "- 📌 Pourquoi c'est adapté\n"
+            "- 💡 Ce qu'il faut retenir\n"
+            "- 🧭 Prochaines étapes\n"
+            "N'utilise pas de titres markdown (#, ##, ###) — garde la même taille de police que le texte, seulement du gras et des emojis.\n"
+            "Utilise le markdown : **gras** pour mettre en avant, - pour les puces, 💡 pour les insights.\n\n"
             "Le profil client a déjà été présenté. Ne le répète jamais. "
             "Si tu as besoin de ces données, considère-les comme déjà connues et passe à la question suivante.\n\n"
             f"Contexte métier :\n{context}"
@@ -127,17 +130,22 @@ def extract_info_from_user_input(user_text, client):
 # --------------------------------------------------
 # Fonctions de calcul
 # --------------------------------------------------
-def projection_epargne(versement_mensuel, rendement_annuel, mois):
+def projection_epargne(versement_initial, versement_mensuel, rendement_annuel, mois):
     r_mensuel = (1 + rendement_annuel) ** (1 / 12) - 1
     capital = np.zeros(mois + 1)
+    capital[0] = versement_initial
+
     for t in range(1, mois + 1):
         capital[t] = capital[t - 1] * (1 + r_mensuel) + versement_mensuel
     return capital
 
-def build_chart(risque, versement_mensuel):
-    x = np.arange(MOIS + 1) / 12
-    total = projection_epargne(versement_mensuel, RENDEMENTS[risque], MOIS)
-    versements = np.arange(MOIS + 1) * versement_mensuel
+
+def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
+    mois = int(horizon_annees * 12)
+    x = np.arange(mois + 1) / 12
+
+    total = projection_epargne(versement_initial, versement_mensuel, RENDEMENTS[risque], mois)
+    versements = versement_initial + np.arange(mois + 1) * versement_mensuel
     gain = total - versements
 
     fig = go.Figure()
@@ -184,8 +192,8 @@ def build_chart(risque, versement_mensuel):
         yaxis_title="Montant (€)",
         template="plotly_white",
         hovermode="x unified",
-        margin=dict(t=70, r=20, l=60, b=70),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        margin=dict(t=60, r=10, l=55, b=55),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
 
     fig.update_yaxes(tickformat=",.0f", ticksuffix=" €")
@@ -200,19 +208,15 @@ def build_chart(risque, versement_mensuel):
 
     return fig
 
+
 # --------------------------------------------------
 # UI Components
 # --------------------------------------------------
 
 def display_client_slots():
     """Affiche les slots du client remplis jusqu'à présent."""
-    client = st.session_state.get("client", {})
-    missing = get_missing_slots(client)
-    
-    if missing:
-        st.caption(f"ℹ️ Infos manquantes: {', '.join(missing)}")
-    else:
-        st.caption("✅ Toutes les infos sont disponibles!")
+    # Ne rien afficher - les infos manquantes ne doivent pas s'afficher au client
+    pass
 
 def assistant_type(container, text: str, delay: float = 0.06, chunk_words: int = 2):
     """Affiche le message assistant progressivement."""
@@ -235,17 +239,68 @@ def assistant_type(container, text: str, delay: float = 0.06, chunk_words: int =
 
     st.session_state.messages.append({"role": "assistant", "content": text})
 
+
+def stream_llm_response(history, context, placeholder):
+    """Stream the assistant response from OpenAI and update a placeholder progressively."""
+    client = get_openai_client()
+    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+    messages = [
+        {"role": "system", "content": (
+            "Tu es Francis, le robot conseiller épargne de Banque Populaire. "
+            "Ton ton est **dynamique, actif et proactif** - tu es un cadre enthousiaste qui croit aux projets de ses clients. "
+            "Tu es **descriptif** : explique pourquoi chaque question est importante et donne du contexte. "
+            "Tu es non contractuel : ne promets jamais de rendement. "
+            "Pose UNE question à la fois si une info manque. "
+            "Demande les infos dans cet ordre : objectif, horizon, mensualité, puis risque. "
+            "⚠️ **IMPORTANT** : Pose AU MOINS 4 questions avant de faire une recommandation (même si toutes les infos semblent remplies). "
+            "Ne saute pas d'étapes, pose chaque question avec enthousiasme. "
+            "Quand tu donnes une recommandation, structure-la en sections comme suit :\n"
+            "- ✅ Recommandation\n"
+            "- 📌 Pourquoi c'est adapté\n"
+            "- 💡 Ce qu'il faut retenir\n"
+            "- 🧭 Prochaines étapes\n"
+            "N'utilise pas de titres markdown (#, ##, ###) — garde la même taille de police que le texte, seulement du gras et des emojis.\n"
+            "Utilise le markdown : **gras** pour mettre en avant, - pour les puces, 💡 pour les insights.\n\n"
+            "Le profil client a déjà été présenté. Ne le répète jamais. "
+            "Si tu as besoin de ces données, considère-les comme déjà connues et passe à la question suivante.\n\n"
+            f"Contexte métier :\n{context}"
+        )}
+    ] + history
+
+    response_text = ""
+    with client.chat.completions.stream(
+        model=model,
+        messages=messages,
+        temperature=0.4,
+        max_tokens=600,
+    ) as stream:
+        for event in stream:
+            if getattr(event, "type", None) == "content.delta":
+                response_text += event.delta
+                placeholder.markdown(response_text)
+            elif getattr(event, "type", None) == "content.done":
+                placeholder.markdown(response_text)
+
+    return response_text.strip()
+
+
 def render_desktop_chat():
-    """Mode desktop avec 2 colonnes."""
-    col_left, col_right = st.columns([1, 1], gap="large")
-    
-    with col_left:
+    """Mode desktop avec 2 colonnes compactes."""
+    if st.session_state.get("mode_mobile", False):
         st.subheader("💬 Conversation")
         render_chat_core()
-    
-    with col_right:
         st.subheader("📊 Projection")
         render_projection_panel()
+    else:
+        col_left, col_right = st.columns([1, 1], gap="small")
+        
+        with col_left:
+            st.subheader("💬 Conversation")
+            render_chat_core()
+        
+        with col_right:
+            st.subheader("📊 Projection")
+            render_projection_panel()
 
 
 def render_chat_core():
@@ -254,7 +309,18 @@ def render_chat_core():
     if "messages" not in st.session_state:
         st.session_state.messages = [{
             "role": "assistant",
-            "content": f"Bonjour {KNOWN_PROFILE['prenom']} 👋\n\nJe suis **Francis**, le robot de **Banque Populaire**.\n\nJe vais te poser quelques questions pour te conseiller de manière adaptée. Commençons!\n\n**Qu'est-ce que tu aimerais préparer grâce à ton épargne ?** (ex: achat immobilier, projet de voyage, fonds d'urgence…)"
+            "content": (
+                f"Bonjour {KNOWN_PROFILE['prenom']} 👋\n\n"
+                "Je suis **Francis**, le robot de **Banque Populaire**. "
+                "Je connais déjà ton profil et je vais l’utiliser pour te conseiller au mieux.\n\n"
+                "**Profil client** :\n"
+                f"- Prénom : {KNOWN_PROFILE['prenom']}\n"
+                f"- Âge : {KNOWN_PROFILE['age']} ans\n"
+                f"- Situation : {KNOWN_PROFILE['situation']}\n"
+                f"- Revenu net mensuel : {KNOWN_PROFILE['revenu_net_mensuel']} €\n"
+                f"- Épargne actuelle (Livret A) : {KNOWN_PROFILE['livret_a']} €\n\n"
+                "Je vais te poser quelques questions pour affiner ma recommandation et te proposer le meilleur dispositif. Commençons !\n\n"
+                "**Qu'est-ce que tu aimerais préparer grâce à ton épargne ?** (ex : achat immobilier, projet de voyage, fonds d'urgence…)")
         }]
     
     if "client" not in st.session_state:
@@ -273,6 +339,9 @@ def render_chat_core():
     
     if "use_llm" not in st.session_state:
         st.session_state.use_llm = False
+
+    if "generating" not in st.session_state:
+        st.session_state.generating = False
     
     # Affichage des messages
     history_box = st.container(height=520, border=True)
@@ -280,7 +349,28 @@ def render_chat_core():
         for m in st.session_state.messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
-    
+
+        if st.session_state.get("generating", False):
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                try:
+                    assistant_reply = stream_llm_response(
+                        st.session_state.messages,
+                        st.session_state.generation_context,
+                        placeholder,
+                    )
+                except Exception as e:
+                    assistant_reply = (
+                        "Désolé, je n'arrive pas à générer ma réponse pour le moment."
+                        " Réessaie plus tard ou bascule en mode non-LLM."
+                    )
+                    placeholder.markdown(assistant_reply)
+
+            st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+            st.session_state.generating = False
+            if "recommand" in assistant_reply.lower() or "assurance vie" in assistant_reply.lower():
+                st.session_state.can_show_projection = True
+
     # Affichage des slots
     display_client_slots()
     
@@ -297,11 +387,6 @@ def render_chat_core():
         handle_user_input(user_text)
         st.rerun()
     
-    # Bouton projection (desktop)
-    if st.session_state.get("can_show_projection", False) and not st.session_state.get("show_projection", False):
-        if st.button("📊 Afficher la projection", type="primary", use_container_width=True):
-            st.session_state.show_projection = True
-            st.rerun()
 
 def handle_user_input(user_text):
     """Traite l'entrée utilisateur: extraction, LLM, état."""
@@ -334,10 +419,9 @@ Règles :
     
     # Choix du mode conversation
     if st.session_state.get("use_llm", False):
-        try:
-            assistant_reply = call_llm(st.session_state.messages, context)
-        except Exception as e:
-            assistant_reply = None
+        st.session_state.generating = True
+        st.session_state.generation_context = context
+        return
     else:
         assistant_reply = None
 
@@ -353,8 +437,20 @@ Règles :
             assistant_reply = "Quel est ton profil de risque ?\n- **Sécurisé** (faible risque)\n- **Équilibré** (risque modéré)\n- **Dynamique** (plus de risque)"
         else:
             assistant_reply = (
-                f"✅ **Recommandation**\n\n"
-                f"Basé sur ton profil, je te recommande une **Assurance vie** avec un profil **{client.get('risque', 'Équilibré').lower()}**.\n\n"
+                "✅ **Recommandation personnalisée**\n\n"
+                f"Je te recommande une **assurance vie** structurée autour d'un mix sécurisé et dynamique, adapté à ton âge ({KNOWN_PROFILE['age']} ans) et à ta capacité d'épargne.\n\n"
+                "📌 **Pourquoi ce choix ?**\n"
+                f"- Ton profil indique une situation stable en tant que {KNOWN_PROFILE['situation']}.\n"
+                f"- Tu disposes déjà de {KNOWN_PROFILE['livret_a']} € sur ton Livret A, ce qui montre que tu peux te permettre un placement plus structuré.\n"
+                "- Une assurance vie te permet de combiner **sécurité**, **flexibilité** et **potentiel de rendement**, tout en conservant un accès aux fonds.\n\n"
+                "💡 **Ce que cela t'apporte** :\n"
+                "- une protection adaptative en cas de besoin\n"
+                "- un capital investi sur du long terme avec un apport mensuel maîtrisé\n"
+                "- la possibilité de diversifier entre fonds en euros et unités de compte selon ton appétence au risque\n\n"
+                "🧭 **Prochaines étapes** :\n"
+                "- Valider ton objectif et ton horizon\n"
+                "- Confirmer ton montant mensuel\n"
+                "- Choisir le niveau de risque qui te convient\n\n"
                 "Clique sur **Voir la projection** pour visualiser l'évolution estimée."
             )
             st.session_state.can_show_projection = True
@@ -363,9 +459,8 @@ Règles :
     if "recommand" in assistant_reply.lower() or "assurance vie" in assistant_reply.lower():
         st.session_state.can_show_projection = True
     
-    # Affiche la réponse avec effet de typing
-    history_box = st.container(height=520, border=True)
-    assistant_type(history_box, assistant_reply)
+    # Enregistre la réponse assistant directement dans le flux de conversation
+    st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
 
 def render_projection_panel():
     """Panel de projection."""
@@ -377,160 +472,187 @@ def render_projection_panel():
         if st.button("📊 Afficher la projection", type="primary", use_container_width=True):
             st.session_state.show_projection = True
             st.rerun()
+
     else:
         client = st.session_state.client
-        risque = st.selectbox(
-            "Profil de risque",
-            ["Sécurisé", "Équilibré", "Dynamique"],
-            index=["Sécurisé", "Équilibré", "Dynamique"].index(client.get("risque", "Équilibré")),
-            key="risque_select"
-        )
-        
-        mensu = client.get("mensualite", 150)
-        st.plotly_chart(build_chart(risque, mensu), use_container_width=True)
-        
-        if st.button("✅ Souscrire en ligne", type="primary", use_container_width=True):
-            st.success("Redirection vers le tunnel de souscription... (démo)")
 
-def render_mobile_iphone():
-    """Rendu mobile dans une frame iPhone avec chat HTML à l'intérieur."""
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{
-            "role": "assistant",
-            "content": (
-                f"Bonjour {KNOWN_PROFILE['prenom']} 👋\n\n"
-                "Je suis **Francis**, le robot de **Banque Populaire**.\n\n"
-                "Je vais te poser quelques questions pour te conseiller de manière adaptée. Commençons !\n\n"
-                "**Qu'est-ce que tu aimerais préparer grâce à ton épargne ?** (ex: achat immobilier, projet de voyage, fonds d'urgence…)")
-        }]
-    if "client" not in st.session_state:
-        st.session_state.client = {
-            "objectif": None,
-            "horizon": None,
-            "mensualite": None,
-            "risque": None
-        }
-    if "can_show_projection" not in st.session_state:
-        st.session_state.can_show_projection = False
-    if "show_projection" not in st.session_state:
-        st.session_state.show_projection = False
+        # --- Valeurs "appliquées" (hypothèses validées) ---
+        # Defaults + préremplissage depuis le client si dispo
+        if "applied_vi" not in st.session_state:
+            st.session_state.applied_vi = int(client.get("versement_initial") or 0)
+        if "applied_vp" not in st.session_state:
+            st.session_state.applied_vp = int(client.get("mensualite") or 150)
+        if "applied_horizon" not in st.session_state:
+            # horizon stocké peut être texte ("10 ans"). On prend 10 par défaut si non parsable
+            st.session_state.applied_horizon = 10
+        if "applied_risque" not in st.session_state:
+            st.session_state.applied_risque = client.get("risque") or "Équilibré"
 
-    inject_devices_css()
+        # --- Layout : graphique gauche / contrôles droite ---
+        left, right = st.columns([2.3, 1], gap="large")
 
-    def build_chat_html(messages, can_show_projection):
-        escaped_messages = []
-        for m in messages:
-            role = m.get("role", "assistant")
-            cls = "user" if role == "user" else "assistant"
-            content = html_lib.escape(m.get("content", "")).replace("\n", "<br>")
-            escaped_messages.append(
-                f"<div class='bubble {cls}'>{content}</div>"
-            )
+        # ✅ Colonne droite : formulaire (VI/VP/Horizon + "carrousel" risque + Valider)
+        with right:
+            st.subheader("⚙️ Hypothèses")
 
-        projection_label = "Voir la projection" if can_show_projection else "Voir la projection"
-        projection_style = "button-enabled" if can_show_projection else "button-disabled"
+            risques = ["Sécurisé", "Équilibré", "Dynamique"]
 
-        return f"""
-        <style>
-          .device-wrap {{ display:flex; justify-content:center; padding:18px 0; }}
-          .phone-screen {{ height: 820px; display:flex; flex-direction:column; background:#fff; }}
-          .statusbar {{ display:flex; justify-content:space-between; font-size:11px; color:#666; padding:8px 12px; border-bottom:1px solid #eee; }}
-          .phone-messages {{ flex:1; overflow-y:auto; padding:12px 14px; background:#f5f7fa; }}
-          .bubble {{ max-width:82%; padding:12px 14px; border-radius:20px; margin:8px 0; line-height:1.45; font-size:14px; word-break:break-word; }}
-          .bubble.user {{ margin-left:auto; background:#2563eb; color:#fff; border-top-right-radius:6px; }}
-          .bubble.assistant {{ margin-right:auto; background:#f3f4f6; color:#111827; border-top-left-radius:6px; }}
-          .phone-footer {{ border-top:1px solid #eee; padding:10px 14px; background:#fff; flex-shrink:0; }}
-          .phone-footer .hint {{ color:#6b7280; font-size:12px; margin-bottom:8px; }}
-          .phone-controls {{ display:flex; gap:8px; margin-top:10px; }}
-          .phone-button {{ flex:1; border-radius:14px; padding:11px 0; font-weight:700; text-align:center; font-size:13px; }}
-          .button-enabled {{ background:#2563eb; color:#fff; }}
-          .button-disabled {{ background:#e5e7eb; color:#9ca3af; }}
-          .phone-home {{ height:36px; background:#f7f7f7; border-top:1px solid #eee; display:flex; align-items:center; justify-content:center; }}
-          .home-bar {{ width:120px; height:4px; background:#000; border-radius:999px; }}
-        </style>
-        <div class='device-wrap'>
-          <div class='device device-iphone-14-pro device-spaceblack'>
-            <div class='device-frame'>
-              <div class='device-screen'>
-                <div class='phone-screen'>
-                  <div class='statusbar'>
-                    <span>9:41</span><span>BP</span><span>📶 🔋</span>
-                  </div>
-                  <div class='phone-messages'>
-                    {''.join(escaped_messages)}
-                  </div>
-                  <div class='phone-footer'>
-                    <div class='hint'>Tape ton message dans le champ Streamlit ci-dessous.</div>
-                    <div class='phone-controls'>
-                      <div class='phone-button {projection_style}'>{projection_label}</div>
-                      <div class='phone-button button-enabled'>Contacter</div>
-                    </div>
-                  </div>
-                  <div class='phone-home'><div class='home-bar'></div></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        """
+            # "Carrousel" : select_slider (look plus "mobile" que selectbox)
+            # Alternative possible: st.radio(..., horizontal=True)
+            with st.form("hypotheses_form", clear_on_submit=False):
+                risque_new = st.select_slider(
+                    "Profil d'investissement",
+                    options=risques,
+                    value=st.session_state.applied_risque
+                )
 
-    components.html(
-        build_chat_html(st.session_state.messages, st.session_state.get("can_show_projection", False)),
-        height=860,
-        scrolling=True
-    )
+                horizon_new = st.slider(
+                    "Horizon (années)",
+                    min_value=1,
+                    max_value=30,
+                    value=int(st.session_state.applied_horizon),
+                    step=1
+                )
 
-    st.markdown("<div style='max-width:390px;margin:18px auto 4px auto;'>", unsafe_allow_html=True)
-    user_text = st.text_input("Tape ton message…", key="mobile_input")
-    st.markdown("</div>", unsafe_allow_html=True)
+                vi_new = st.number_input(
+                    "VI (versement initial)",
+                    min_value=0,
+                    step=100,
+                    value=int(st.session_state.applied_vi)
+                )
 
-    if user_text:
-        handle_user_input(user_text)
-        st.session_state.mobile_input = ""
-        st.rerun()
+                vp_new = st.number_input(
+                    "VP (mensualité)",
+                    min_value=0,
+                    step=10,
+                    value=int(st.session_state.applied_vp)
+                )
 
-    can_show = st.session_state.get("can_show_projection", False)
-    col1, col2 = st.columns(2, gap="small")
-    with col1:
-        if st.button("📊 Afficher la projection", disabled=not can_show, use_container_width=True, key="mobile_proj"):
-            st.session_state.show_projection = True
-            st.rerun()
-    with col2:
-        if st.button("📞 Contacter mon conseiller", use_container_width=True, key="mobile_advisor"):
-            st.toast("Conseiller", icon="✅")
+                submitted = st.form_submit_button("✅ Valider ces hypothèses", use_container_width=True)
 
-    if st.session_state.get("show_projection", False):
-        st.divider()
-        st.subheader("📊 Projection")
-        client = st.session_state.client
-        risque = st.selectbox(
-            "Profil de risque",
-            ["Sécurisé", "Équilibré", "Dynamique"],
-            index=["Sécurisé", "Équilibré", "Dynamique"].index(client.get("risque", "Équilibré")),
-            key="mobile_risque"
-        )
-        mensu = client.get("mensualite", 150)
-        st.plotly_chart(build_chart(risque, mensu), use_container_width=True)
+            if submitted:
+                st.session_state.applied_risque = risque_new
+                st.session_state.applied_horizon = horizon_new
+                st.session_state.applied_vi = int(vi_new)
+                st.session_state.applied_vp = int(vp_new)
+                st.rerun()
+
+        # ✅ Colonne gauche : métriques + graphique
+        with left:
+            risque = st.session_state.applied_risque
+            horizon = st.session_state.applied_horizon
+            vi = st.session_state.applied_vi
+            vp = st.session_state.applied_vp
+
+            # Chiffres clés (optionnel mais très utile)
+            mois = int(horizon * 12)
+            cap = projection_epargne(vi, vp, RENDEMENTS[risque], mois)[-1]
+            vers = vi + vp * mois
+            gain = cap - vers
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Capital estimé", f"{cap:,.0f} €".replace(",", " "))
+            m2.metric("Versements", f"{vers:,.0f} €".replace(",", " "))
+            m3.metric("Gain estimé", f"{gain:,.0f} €".replace(",", " "))
+
+            st.plotly_chart(build_chart(risque, vi, vp, horizon), use_container_width=True)
+
+            st.divider()
+
+            # CTA sous le graphe (Souscrire + Conseiller)
+            c1, c2 = st.columns(2, gap="small")
+            with c1:
+                if st.button("✅ Souscrire en ligne", type="primary", use_container_width=True, key="btn_subscribe"):
+                    st.success("Redirection vers le tunnel de souscription... (démo)")
+            with c2:
+                if st.button("📞 Contacter conseiller", use_container_width=True, key="btn_contact_advisor"):
+                    st.info("Un conseiller Banque Populaire va vous recontacter. (démo)")
+
+
+def render_mobile_chat():
+    """Rendu unifié pour desktop et mobile (même UI)."""
+    render_chat_core()
 
 # ==================================================
 # MAIN UI (Interface principale)
 # ==================================================
-st.header("Francis - Robot épargne Banque Populaire")
-
-st.divider()
-
-# Mode de conversation (pré-remplissage vs LLM)
-use_llm = st.checkbox(
-    "Activer le mode LLM",
-    value=st.session_state.get("use_llm", False),
-    help="Quand activé, les réponses peuvent être générées par l'IA. Sinon, le flux reste en mode conversation pré-remplie."
+st.markdown(
+    """
+    <style>
+    h1 {
+        margin-top: 1.4rem !important;
+        margin-bottom: 0.35rem !important;
+        color: #0f62fe !important;
+        font-size: 2rem !important;
+    }
+    .main .block-container {
+        padding-top: 0.5rem !important;
+        padding-bottom: 0.5rem !important;
+    }
+    .stButton button {
+        margin: 0 !important;
+        padding: 0.45rem 0.8rem !important;
+        font-size: 0.78rem !important;
+        min-width: 100% !important;
+        white-space: nowrap !important;
+        border-radius: 999px !important;
+        background-color: #e0e7ff !important;
+        color: #0f172a !important;
+        border: 1px solid #c7d2fe !important;
+        box-shadow: none !important;
+    }
+    .stButton button:active {
+        background-color: #c7d2fe !important;
+    }
+    .stButton button.active {
+        background-color: #0f62fe !important;
+        color: #fff !important;
+        border-color: #0f62fe !important;
+    }
+    .stButton {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+    }
+    .stMetric .stMetricValue {
+        font-size: 1.2rem !important;
+        line-height: 1.1 !important;
+        white-space: normal !important;
+        overflow-wrap: break-word !important;
+    }
+    .stMetric .stMetricValue > div {
+        white-space: normal !important;
+    }
+    .stCheckbox {
+        margin-top: 0 !important;
+        margin-bottom: 0.35rem !important;
+    }
+    .stCheckbox label {
+        font-size: 0.8rem !important;
+        color: #0f172a !important;
+        line-height: 1.2 !important;
+    }
+    .stCheckbox input {
+        transform: scale(0.95) !important;
+        margin-right: 0.25rem !important;
+    }
+    .stMarkdown p {
+        margin: 0.2rem 0 !important;
+        font-size: 0.9rem !important;
+    }
+    """,
+    unsafe_allow_html=True
 )
-st.session_state.use_llm = use_llm
 
-# Toggle mode mobile
-mode_mobile = st.toggle("📱 Mode mobile iPhone", value=False)
+if "use_llm" not in st.session_state:
+    st.session_state.use_llm = False
+if "mode_mobile" not in st.session_state:
+    st.session_state.mode_mobile = False
 
-if mode_mobile:
-    render_mobile_iphone()
-else:
-    render_desktop_chat()
+st.header("🤖 Francis - Robot épargne Banque Populaire")
+
+st.checkbox("Activer le mode LLM", value=st.session_state.use_llm, key="use_llm_toggle")
+st.session_state.use_llm = st.session_state.use_llm_toggle
+st.checkbox("Mode mobile", value=st.session_state.mode_mobile, key="mode_mobile_toggle")
+st.session_state.mode_mobile = st.session_state.mode_mobile_toggle
+
+render_desktop_chat()
