@@ -3,6 +3,8 @@ import numpy as np
 import plotly.graph_objects as go
 import time
 import re
+from catalog import PRODUCT_CATALOG
+from reco_rules import recommend_products
 from openai import OpenAI
 
 
@@ -26,6 +28,13 @@ RENDEMENTS = {
     "Sécurisé": 0.020,
     "Équilibré": 0.050,
     "Dynamique": 0.080
+}
+
+# Scénarios : multiplicateurs appliqués au rendement base
+SCENARIO_MULTIPLIERS = {
+    "Pessimiste": 0.6,
+    "Base": 1.0,
+    "Optimiste": 1.4
 }
 
 # --------------------------------------------------
@@ -74,10 +83,28 @@ def call_llm(history, context):
 # --------------------------------------------------
 # Extracteurs d'info
 # --------------------------------------------------
-def extract_montant(text):
-    """Extrait un montant (nombre) du texte."""
-    m = re.search(r"(\d+)", text.replace(" ", ""))
-    return int(m.group(1)) if m else None
+def extract_montant(text: str):
+    t = text.lower()
+
+    # Si l'utilisateur parle explicitement de temps, on évite de prendre ce nombre comme montant
+    # Ex: "10 ans", "18 mois", "3-5 ans"
+    if re.search(r"\b\d+\s*(ans|an|mois)\b", t) or re.search(r"\b\d+\s*(à|-)\s*\d+\s*ans\b", t):
+        # On ne retourne pas de montant sur ce pattern (sinon "10" devient VP)
+        # Un montant doit être marqué par € ou /mois etc.
+        return None
+
+    # Montant explicite en euros
+    m = re.search(r"(\d[\d\s]{0,10})\s*€", t)
+    if m:
+        return int(m.group(1).replace(" ", ""))
+
+    # Mensualité explicite
+    m = re.search(r"(\d[\d\s]{0,10})\s*(€\s*)?(/mois|par mois|mensuel|mensuelle)", t)
+    if m:
+        return int(m.group(1).replace(" ", ""))
+
+    # Sinon: on NE devine pas un montant à partir d'un simple nombre
+    return None
 
 def extract_risque(text):
     """Extrait le niveau de risque du texte."""
@@ -94,10 +121,38 @@ def get_missing_slots(client):
     """Retourne la liste des slots manquants."""
     missing = []
     if not client.get("objectif"): missing.append("objectif")
-    if not client.get("horizon"): missing.append("horizon")
+    if not client.get("horizon_annees"): missing.append("horizon")
     if not client.get("mensualite"): missing.append("mensualite")
     if not client.get("risque"): missing.append("risque")
     return missing
+
+def extract_horizon_years(text: str):
+    """
+    Extrait un horizon (en années) de manière robuste.
+    Gère:
+      - "10 ans"
+      - "3 à 5 ans" / "3-5 ans" (retient le max)
+      - "18 mois" (convertit en années, arrondi supérieur)
+    """
+    t = text.lower().replace(" ", "")
+
+    # Plage en années : "3-5 ans" ou "3 à 5 ans"
+    m = re.search(r"(\d+)(?:à|-)(\d+)ans?", t)
+    if m:
+        return int(m.group(2))
+
+    # Années simples : "10 ans"
+    m = re.search(r"(\d+)ans?", t)
+    if m:
+        return int(m.group(1))
+
+    # Mois : "18 mois"
+    m = re.search(r"(\d+)mois", t)
+    if m:
+        mois = int(m.group(1))
+        return max(1, int(np.ceil(mois / 12)))
+
+    return None
 
 def extract_info_from_user_input(user_text, client):
     """Essaye d'extraire plusieurs infos du message utilisateur."""
@@ -106,25 +161,22 @@ def extract_info_from_user_input(user_text, client):
     if montant and not client.get("mensualite"):
         client["mensualite"] = montant
     
+    # --- HORIZON (prioritaire pour éviter la confusion avec un montant) ---
+    h = extract_horizon_years(user_text)
+    if h and not client.get("horizon_annees"):
+        client["horizon_annees"] = h
+        client["horizon"] = f"{h} ans"  # pour affichage
+
+        # préremplissage pour ton panneau d'hypothèses si tu l'utilises
+        st.session_state.applied_horizon = h
+    
     # Extraction du risque
     risque = extract_risque(user_text)
     if risque and not client.get("risque"):
         client["risque"] = risque
     
-    # Horizon simple (ex: "2 ans", "3 à 5 ans")
-    if not client.get("horizon"):
-        horizon_patterns = [
-            r"(\d+)\s*(?:à|-)\s*(\d+)\s*ans?",
-            r"(\d+)\s*ans?"
-        ]
-        for pattern in horizon_patterns:
-            match = re.search(pattern, user_text.lower())
-            if match:
-                client["horizon"] = user_text[match.start():match.end()]
-                break
-    
     # Si aucun slot n'a été rempli, le texte entier est considéré comme objectif/réponse libre
-    if not montant and not risque and not client.get("horizon") and not client.get("objectif"):
+    if (montant is None) and (risque is None) and (client.get("horizon_annees") is None) and (not client.get("objectif")):
         client["objectif"] = user_text.strip()
 
 # --------------------------------------------------
@@ -148,6 +200,11 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
     versements = versement_initial + np.arange(mois + 1) * versement_mensuel
     gain = total - versements
 
+    # ✅ FORCER DES ENTIERS POUR LE HOVER
+    total = np.round(total, 0)
+    versements = np.round(versements, 0)
+    gain = np.round(gain, 0)
+
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
@@ -157,7 +214,7 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
         line=dict(color="rgba(107,114,128,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(107,114,128,0.15)",
-        hovertemplate="Années: %{x:.1f}<br>Versements: %{y:,.0f} €<extra></extra>".replace(",", " ")
+        hovertemplate="Années: %{x:.0f}<br>Versements: %{y:,.0f} €<extra></extra>".replace(",", " ")
     ))
 
     fig.add_trace(go.Scatter(
@@ -167,7 +224,7 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
         line=dict(color="rgba(16,185,129,0)", width=0),
         fill="tonexty",
         fillcolor="rgba(16,185,129,0.18)",
-        hovertemplate="Années: %{x:.1f}<br>Gain estimé: %{customdata:,.0f} €<extra></extra>".replace(",", " "),
+        hovertemplate="Années: %{x:.0f}<br>Gain estimé: %{customdata:,.0f} €<extra></extra>".replace(",", " "),
         customdata=gain
     ))
 
@@ -177,7 +234,7 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
         name="Capital estimé",
         line=dict(color="#2563EB", width=4),
         hovertemplate=(
-            "Années: %{x:.1f}<br>"
+            "Années: %{x:.0f}<br>"
             "Capital: %{y:,.0f} €<br>"
             "Versements: %{customdata[0]:,.0f} €<br>"
             "Gain estimé: %{customdata[1]:,.0f} €"
@@ -187,20 +244,21 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
     ))
 
     fig.update_layout(
-        title=f"Évolution projetée — Profil {risque} (illustratif)",
+        title_text="",
         xaxis_title="Années",
         yaxis_title="Montant (€)",
         template="plotly_white",
         hovermode="x unified",
-        margin=dict(t=60, r=10, l=55, b=55),
+        margin=dict(t=20, r=10, l=55, b=55),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+
     )
 
     fig.update_yaxes(tickformat=",.0f", ticksuffix=" €")
-    fig.update_xaxes(dtick=1)
+    fig.update_xaxes(dtick=1, hoverformat=".0f")
 
     fig.add_annotation(
-        text="Hypothèses illustratives – aucune garantie – démonstrateur non contractuel",
+        text="Hypothèses illustratives",
         x=0, y=-0.22, xref="paper", yref="paper",
         xanchor="left", showarrow=False,
         font=dict(size=11, color="#6B7280")
@@ -397,24 +455,62 @@ def handle_user_input(user_text):
     
     # Extraction intelligente
     extract_info_from_user_input(user_text, client)
-    
-    # Détecte si toutes les infos sont remplies
-    if all([client.get("objectif"), client.get("horizon"), client.get("mensualite"), client.get("risque")]):
+
+    # ✅ Détecte si toutes les infos sont remplies (utilise horizon_annees)
+    if all([client.get("objectif"), client.get("horizon_annees"), client.get("mensualite"), client.get("risque")]):
         st.session_state.can_show_projection = True
-    
-    # Build context
+
+        # ✅ 1) Applique les règles de recommandation (code choisit)
+        recommended, alternatives, debug = recommend_products(
+            client=client,
+            project_text=client.get("objectif", ""),
+            catalog=PRODUCT_CATALOG,
+            top_k=3
+        )
+
+        # Stocke pour l’onglet "Règles"
+        st.session_state.reco = {
+            "recommended": recommended,
+            "alternatives": alternatives,
+            "debug": debug
+        }
+
+        # Option : activer projection seulement si le produit supporte projection
+        if recommended and recommended.get("projection", {}).get("supports_VI_VP", False):
+            st.session_state.can_show_projection = True
+        else:
+            # si pas de projection (ex livret dans certains choix), tu peux décider autrement
+            st.session_state.can_show_projection = False
+
+    else:
+        # pas assez d'infos pour recommander
+        st.session_state.reco = None
+
+    # ✅ 2) Build context (inclure la reco si disponible)
+    reco = st.session_state.get("reco")
+    reco_txt = ""
+    if reco and reco.get("recommended"):
+        reco_txt = f"""
+    Recommandation (calculée par les règles) :
+    - Produit recommandé : {reco['recommended']['name']} ({reco['recommended']['id']})
+    - Alternatives : {', '.join([p['name'] for p in (reco.get('alternatives') or [])]) or '—'}
+    - Debug goals : {reco['debug'].get('goals', []) if reco.get('debug') else '—'}
+    """
+
     context = f"""
-État client actuel :
-- Objectif: {client.get('objectif', 'Non défini')}
-- Horizon: {client.get('horizon', 'Non défini')}
-- Mensualité: {client.get('mensualite', 'Non défini')} €
-- Risque: {client.get('risque', 'Non défini')}
+    État client actuel :
+    - Objectif : {client.get('objectif', 'Non défini')}
+    - Horizon : {client.get('horizon', 'Non défini')} (horizon_annees={client.get('horizon_annees', 'Non défini')})
+    - Mensualité : {client.get('mensualite', 'Non défini')} €
+    - Risque : {client.get('risque', 'Non défini')}
 
-Slots manquants: {', '.join(get_missing_slots(client)) or 'aucun'}
+    Slots manquants : {', '.join(get_missing_slots(client)) or 'aucun'}
 
-Règles :
-- Pose UNE question à la fois pour les infos manquantes.
-- Si toutes les infos sont définies, recommande Assurance vie adaptée au risque.
+    {reco_txt}
+
+    Règles :
+    - Si des infos manquent, pose UNE question à la fois.
+    - Si tout est défini, explique la recommandation (ne la change pas) et propose les prochaines étapes.
 """
     
     # Choix du mode conversation
@@ -493,8 +589,8 @@ def render_projection_panel():
 
         # ✅ Colonne droite : formulaire (VI/VP/Horizon + "carrousel" risque + Valider)
         with right:
-            st.subheader("⚙️ Hypothèses")
-
+            st.markdown("<div class='hyp-title'>⚙️ Hypothèses</div>", unsafe_allow_html=True)
+            st.markdown("<div class='hyp-panel'>", unsafe_allow_html=True)
             risques = ["Sécurisé", "Équilibré", "Dynamique"]
 
             # "Carrousel" : select_slider (look plus "mobile" que selectbox)
@@ -528,7 +624,7 @@ def render_projection_panel():
                     value=int(st.session_state.applied_vp)
                 )
 
-                submitted = st.form_submit_button("✅ Valider ces hypothèses", use_container_width=True)
+                submitted = st.form_submit_button("Valider\u00A0✅", use_container_width=True)
 
             if submitted:
                 st.session_state.applied_risque = risque_new
@@ -536,6 +632,8 @@ def render_projection_panel():
                 st.session_state.applied_vi = int(vi_new)
                 st.session_state.applied_vp = int(vp_new)
                 st.rerun()
+
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # ✅ Colonne gauche : métriques + graphique
         with left:
@@ -585,14 +683,11 @@ st.markdown(
         color: #0f62fe !important;
         font-size: 2rem !important;
     }
-    .main .block-container {
-        padding-top: 0.5rem !important;
-        padding-bottom: 0.5rem !important;
-    }
+    
     .stButton button {
         margin: 0 !important;
-        padding: 0.45rem 0.8rem !important;
-        font-size: 0.78rem !important;
+        padding: 0.40rem 0.75rem !important;
+        font-size: 0.72rem !important;
         min-width: 100% !important;
         white-space: nowrap !important;
         border-radius: 999px !important;
@@ -614,8 +709,8 @@ st.markdown(
         margin-bottom: 0 !important;
     }
     .stMetric .stMetricValue {
-        font-size: 1.2rem !important;
-        line-height: 1.1 !important;
+        font-size: 0.95rem !important;
+        line-height: 1.05 !important;
         white-space: normal !important;
         overflow-wrap: break-word !important;
     }
@@ -639,6 +734,74 @@ st.markdown(
         margin: 0.2rem 0 !important;
         font-size: 0.9rem !important;
     }
+    /* Titre "Hypothèses" custom */
+    .hyp-title {
+        font-size: 1.05rem !important;   /* baisse encore si tu veux (ex: 0.95rem) */
+        font-weight: 700 !important;
+        margin: 0 0 0.6rem 0 !important;
+        letter-spacing: 0.2px;
+    }
+    /* Bouton "Valider" (form_submit_button) dans le panneau Hypothèses */
+    .hyp-panel [data-testid="stFormSubmitButton"] button {
+        font-size: 0.60rem !important;     /* ↓ police */
+        padding: 0.25rem 0.50rem !important; /* ↓ hauteur/largeur */
+        line-height: 1 !important;
+        min-height: 28px !important;       /* ↓ hauteur */
+        border-radius: 12px !important;    /* coins plus petits */
+    }
+    /* (Optionnel) éviter que le bouton prenne trop de largeur visuelle */
+    .hyp-panel [data-testid="stFormSubmitButton"] {
+    margin-top: 0.4rem !important;
+    }
+    /* =========================
+    UNIFORMISER LA POLICE DU CHAT
+    ========================= */
+
+    /* Texte standard dans les messages */
+    div[data-testid="stChatMessage"] * {
+        font-size: 0.95rem !important;     /* Ajuste ici : 0.9 / 0.95 / 1.0 */
+        line-height: 1.35 !important;
+    }
+
+    /* Empêcher les titres Markdown (h1/h2/h3/...) d'agrandir la police */
+    div[data-testid="stChatMessage"] h1,
+    div[data-testid="stChatMessage"] h2,
+    div[data-testid="stChatMessage"] h3,
+    div[data-testid="stChatMessage"] h4,
+    div[data-testid="stChatMessage"] h5,
+    div[data-testid="stChatMessage"] h6 {
+        font-size: 0.95rem !important;     /* même taille que le reste */
+        margin: 0.2rem 0 !important;
+        font-weight: 700 !important;       /* conserve l’effet “titre” sans changer la taille */
+    }
+
+    /* Listes (puces) : même taille et marges réduites */
+    div[data-testid="stChatMessage"] ul,
+    div[data-testid="stChatMessage"] ol,
+    div[data-testid="stChatMessage"] li {
+        font-size: 0.95rem !important;
+        margin: 0.15rem 0 !important;
+    }
+
+    /* Gras : conserve le gras mais sans changer la taille */
+    div[data-testid="stChatMessage"] strong {
+        font-size: 0.95rem !important;
+        font-weight: 700 !important;
+    }
+
+    
+    /* Remonter le contenu */
+    section.main .block-container {
+        padding-top: 0.2rem !important;
+    }
+    section.main h1,
+    section.main h2 {
+        margin-top: 0.1rem !important;
+    }
+    section.main [data-testid="stHeading"] + div {
+        margin-top: 0.1rem !important;
+    }
+    
     """,
     unsafe_allow_html=True
 )
