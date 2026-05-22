@@ -18,7 +18,7 @@ KNOWN_PROFILE = {
     "age": 28,
     "situation": "Salariée chez Decathlon",
     "revenu_net_mensuel": 2150,
-    "livret_a": 22950
+    "livret_a": 13543
 }
 
 HORIZON_ANNEES = 10
@@ -196,67 +196,114 @@ def build_chart(risque, versement_initial, versement_mensuel, horizon_annees):
     mois = int(horizon_annees * 12)
     x = np.arange(mois + 1) / 12
 
-    total = projection_epargne(versement_initial, versement_mensuel, RENDEMENTS[risque], mois)
-    versements = versement_initial + np.arange(mois + 1) * versement_mensuel
-    gain = total - versements
+    # Base return selon profil
+    base_return = RENDEMENTS[risque]
 
-    # ✅ FORCER DES ENTIERS POUR LE HOVER
-    total = np.round(total, 0)
+    # Calcul des 3 scénarios
+    scenario_returns = {
+        "Prudent": base_return * SCENARIO_MULTIPLIERS["Pessimiste"],
+        "Central":   base_return * SCENARIO_MULTIPLIERS["Base"],
+        "Favorable":  base_return * SCENARIO_MULTIPLIERS["Optimiste"],
+    }
+
+    totals = {}
+    for scen, r in scenario_returns.items():
+        totals[scen] = projection_epargne(versement_initial, versement_mensuel, r, mois)
+
+    versements = versement_initial + np.arange(mois + 1) * versement_mensuel
+
+    # Arrondir pour éviter les décimales partout (hover + affichage)
     versements = np.round(versements, 0)
-    gain = np.round(gain, 0)
+    for scen in totals:
+        totals[scen] = np.round(totals[scen], 0)
+
+    gain_central = totals["Central"] - versements
 
     fig = go.Figure()
 
+    # 1) Versements cumulés (référence)
     fig.add_trace(go.Scatter(
         x=x, y=versements,
         mode="lines",
-        name="Versements cumulés",
+        name="Versements",
         line=dict(color="rgba(107,114,128,1)", width=2),
         fill="tozeroy",
-        fillcolor="rgba(107,114,128,0.15)",
+        fillcolor="rgba(107,114,128,0.12)",
         hovertemplate="Années: %{x:.0f}<br>Versements: %{y:,.0f} €<extra></extra>".replace(",", " ")
     ))
 
+    # 2) Enveloppe Prudent -> Favorable (effet pro)
     fig.add_trace(go.Scatter(
-        x=x, y=total,
+        x=x, y=totals["Prudent"],
         mode="lines",
-        name="Gain estimé",
-        line=dict(color="rgba(16,185,129,0)", width=0),
-        fill="tonexty",
-        fillcolor="rgba(16,185,129,0.18)",
-        hovertemplate="Années: %{x:.0f}<br>Gain estimé: %{customdata:,.0f} €<extra></extra>".replace(",", " "),
-        customdata=gain
+        name="Capital Prudent",
+        line=dict(color="rgba(239,68,68,0.0)", width=0),
+        hoverinfo="skip",
+        showlegend=False
     ))
 
     fig.add_trace(go.Scatter(
-        x=x, y=total,
+        x=x, y=totals["Favorable"],
         mode="lines",
-        name="Capital estimé",
+        name="Fourchette (Prudent-Favorable)",
+        line=dict(color="rgba(16,185,129,0.0)", width=0),
+        fill="tonexty",
+        fillcolor="rgba(16,185,129,0.15)",
+        hoverinfo="skip"
+    ))
+
+    # 3) Ligne Centrale (la trajectoire centrale)
+    fig.add_trace(go.Scatter(
+        x=x, y=totals["Central"],
+        mode="lines",
+        name="Capital (Central)",
         line=dict(color="#2563EB", width=4),
+        customdata=np.column_stack([versements, gain_central]),
         hovertemplate=(
             "Années: %{x:.0f}<br>"
             "Capital: %{y:,.0f} €<br>"
             "Versements: %{customdata[0]:,.0f} €<br>"
             "Gain estimé: %{customdata[1]:,.0f} €"
             "<extra></extra>"
-        ).replace(",", " "),
-        customdata=np.column_stack([versements, gain])
+        ).replace(",", " ")
     ))
 
+    # (Option) lignes Prudent/Favorable visibles aussi (si tu veux)
+    fig.add_trace(go.Scatter(
+        x=x, y=totals["Prudent"],
+        mode="lines",
+        name="Capital (Prudent)",
+        showlegend=False,  # ✅ cache dans la légende
+        line=dict(color="rgba(239,68,68,0.9)", width=2, dash="dot"),
+        hovertemplate="Années: %{x:.0f}<br>Capital Prudent: %{y:,.0f} €<extra></extra>".replace(",", " ")
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=totals["Favorable"],
+        mode="lines",
+        name="Capital (Favorable)",
+        showlegend=False,  # ✅ cache dans la légende
+        line=dict(color="rgba(16,185,129,0.9)", width=2, dash="dot"),
+        hovertemplate="Années: %{x:.0f}<br>Capital Favorable: %{y:,.0f} €<extra></extra>".replace(",", " ")
+    ))
+
+    # Layout clean (et suppression du titre)
     fig.update_layout(
         title_text="",
-        xaxis_title="Années",
-        yaxis_title="Montant (€)",
-        template="plotly_white",
-        hovermode="x unified",
-        margin=dict(t=20, r=10, l=55, b=55),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=11),
+            itemwidth=140
+        )
     )
 
-    fig.update_yaxes(tickformat=",.0f", ticksuffix=" €")
+    fig.update_yaxes(tickformat=",.0f", ticksuffix=" €", hoverformat=",.0f")
     fig.update_xaxes(dtick=1, hoverformat=".0f")
 
+    # Mention courte uniquement
     fig.add_annotation(
         text="Hypothèses illustratives",
         x=0, y=-0.22, xref="paper", yref="paper",
@@ -396,7 +443,7 @@ def render_chat_core():
         st.session_state.show_projection = False
     
     if "use_llm" not in st.session_state:
-        st.session_state.use_llm = False
+        st.session_state.use_llm = True
 
     if "generating" not in st.session_state:
         st.session_state.generating = False
@@ -806,16 +853,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-if "use_llm" not in st.session_state:
-    st.session_state.use_llm = False
-if "mode_mobile" not in st.session_state:
-    st.session_state.mode_mobile = False
-
-st.header("🤖 Francis - Robot épargne Banque Populaire")
-
-st.checkbox("Activer le mode LLM", value=st.session_state.use_llm, key="use_llm_toggle")
-st.session_state.use_llm = st.session_state.use_llm_toggle
-st.checkbox("Mode mobile", value=st.session_state.mode_mobile, key="mode_mobile_toggle")
-st.session_state.mode_mobile = st.session_state.mode_mobile_toggle
+# MAIN UI
+st.header("🤖 Francis – Robot épargne Banque Populaire")
 
 render_desktop_chat()
