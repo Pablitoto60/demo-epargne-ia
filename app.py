@@ -37,6 +37,58 @@ SCENARIO_MULTIPLIERS = {
     "Optimiste": 1.4
 }
 
+QUIZ_QUESTIONS = [
+    {
+        "id": "q1_risk_return",
+        "type": "QCF",
+        "title": "1/4",
+        "question": "Une perspective de gain élevé implique généralement un risque de perte en capital plus important.",
+        "choices": ["Vrai", "Faux"],
+        "correct": "Vrai",
+        "ok": "✅ Exact. Plus de potentiel implique généralement plus de variations possibles.",
+        "ko": "❌ Pas tout à fait. Viser plus de rendement implique généralement d’accepter plus de risque."
+    },
+    {
+        "id": "q2_etf",
+        "type": "QCF",
+        "title": "2/4",
+        "question": "Un ETF est un fonds à capital garanti.",
+        "choices": ["Vrai", "Faux"],
+        "correct": "Faux",
+        "ok": "✅ Exact. Un ETF suit un indice : sa valeur peut monter comme baisser.",
+        "ko": "❌ Non. Un ETF n’est pas garanti : il réplique un indice et fluctue."
+    },
+    {
+        "id": "q3_drawdown",
+        "type": "QFD",
+        "title": "3/4",
+        "question": "Si ton épargne baisse de -10% sur une année, tu fais quoi ?",
+        "choices": [
+            "Je vends pour éviter que ça baisse davantage",
+            "Je ne touche à rien et j’attends",
+            "Je continue / je renforce progressivement si je peux",
+        ],
+        "feedback": {
+            "Je vends pour éviter que ça baisse davantage": "🛡️ OK — on privilégiera stabilité et visibilité.",
+            "Je ne touche à rien et j’attends": "⚖️ OK — tu sembles à l’aise avec des variations modérées.",
+            "Je continue / je renforce progressivement si je peux": "🚀 OK — tu acceptes mieux la volatilité sur le long terme.",
+        }
+    },
+    {
+        "id": "q4_esg",
+        "type": "ESG",
+        "title": "4/4",
+        "question": "Sur une échelle de 1 à 5, quelle importance accordes-tu à l’ESG (environnement/social/gouvernance) ?",
+        "scale": [1, 2, 3, 4, 5],
+        "feedback": {
+            1: "OK — tu privilégies surtout les critères financiers.",
+            2: "OK — l’ESG n’est pas prioritaire.",
+            3: "OK — tu veux un équilibre.",
+            4: "OK — tu veux intégrer l’ESG dans le choix.",
+            5: "OK — l’ESG est très important pour toi (filtre secteurs).",
+        }
+    },
+]
 # --------------------------------------------------
 # OpenAI Client (cached)
 # --------------------------------------------------
@@ -106,24 +158,39 @@ def extract_montant(text: str):
     # Sinon: on NE devine pas un montant à partir d'un simple nombre
     return None
 
-def extract_risque(text):
-    """Extrait le niveau de risque du texte."""
+def extract_risque(text: str):
     t = text.lower()
-    if any(w in t for w in ["sécur", "secur", "prudent", "conservat", "faible"]):
+
+    # Expressions naturelles
+    if any(x in t for x in ["peu de risque", "pas de risque", "faible risque", "risque faible", "prudent", "sécurisé", "securise"]):
         return "Sécurisé"
-    if any(w in t for w in ["dyna", "agressif", "élevé", "elevé", "fort"]):
-        return "Dynamique"
-    if any(w in t for w in ["équil", "equil", "moyen", "modéré", "moderate"]):
+
+    if any(x in t for x in ["pas trop de risque", "je sais pas", "je ne sais pas", "risque modéré", "risque modere", "modéré", "modere", "équilibré", "equilibre", "moyen"]):
         return "Équilibré"
+
+    if any(x in t for x in ["beaucoup de risque", "risque élevé", "risque eleve", "fort risque", "agressif", "dynamique", "prendre des risques"]):
+        return "Dynamique"
+
+    # Mots-clés courts (fallback)
+    if any(w in t for w in ["sécur", "secur", "faible"]):
+        return "Sécurisé"
+    if any(w in t for w in ["équil", "equil"]):
+        return "Équilibré"
+    if any(w in t for w in ["dyna", "élevé", "elevé", "fort"]):
+        return "Dynamique"
+
     return None
 
 def get_missing_slots(client):
-    """Retourne la liste des slots manquants."""
     missing = []
-    if not client.get("objectif"): missing.append("objectif")
-    if not client.get("horizon_annees"): missing.append("horizon")
-    if not client.get("mensualite"): missing.append("mensualite")
-    if not client.get("risque"): missing.append("risque")
+    if not client.get("objectif"):
+        missing.append("objectif")
+    if not client.get("horizon_annees"):
+        missing.append("horizon")
+    if client.get("mensualite") is None:
+        missing.append("mensualite")
+    if not client.get("risque"):
+        missing.append("risque")
     return missing
 
 def extract_horizon_years(text: str):
@@ -161,11 +228,30 @@ def extract_info_from_user_input(user_text, client):
     if montant and not client.get("mensualite"):
         client["mensualite"] = montant
     
+    # Fallback mensualité : si l'utilisateur répond juste "200" et qu'on attend la mensualité
+    if (client.get("mensualite") is None) and st.session_state.get("expected_slot") == "mensualite":
+        m = re.fullmatch(r"\s*(\d{1,5})\s*", user_text)
+        if m:
+            vp = int(m.group(1))
+            if 5 <= vp <= 10000:
+                client["mensualite"] = vp
+                st.session_state.applied_vp = vp
+
     # --- HORIZON (prioritaire pour éviter la confusion avec un montant) ---
     h = extract_horizon_years(user_text)
     if h and not client.get("horizon_annees"):
         client["horizon_annees"] = h
         client["horizon"] = f"{h} ans"  # pour affichage
+
+    # Fallback horizon : si l'utilisateur répond juste "10" et qu'on attend l'horizon
+    if (not client.get("horizon_annees")) and st.session_state.get("expected_slot") == "horizon":
+        m = re.fullmatch(r"\s*(\d{1,2})\s*", user_text)
+        if m:
+            h2 = int(m.group(1))
+            if 1 <= h2 <= 60:
+                client["horizon_annees"] = h2
+                client["horizon"] = f"{h2} ans"
+                st.session_state.applied_horizon = h2
 
         # préremplissage pour ton panneau d'hypothèses si tu l'utilises
         st.session_state.applied_horizon = h
@@ -388,25 +474,124 @@ def stream_llm_response(history, context, placeholder):
 
     return response_text.strip()
 
+def render_quiz_gaming():
+    """Affiche le quiz (4 cartes) dans la colonne droite."""
+    st.subheader("🎮 Mini‑quiz")
+    st.caption("4 questions rapides pour affiner le conseil.")
+
+    total = len(QUIZ_QUESTIONS)
+    step = st.session_state.get("quiz_step", 0)
+    st.progress(min(step, total) / total)
+
+    if st.session_state.get("quiz_done", False):
+        st.success(f"✅ Quiz terminé — score: {st.session_state.get('quiz_score', 0)}/2")
+        st.caption("La projection est maintenant disponible ✅")
+        return
+
+    q = QUIZ_QUESTIONS[step]
+    st.markdown(f"**{q['title']}**")
+    st.markdown(q["question"])
+
+    # ✅ ÉTAPE 2 : si on vient de valider, on affiche l'explication et on attend "Suivant"
+    if st.session_state.get("quiz_locked", False) and st.session_state.get("quiz_feedback") is not None:
+        fb = st.session_state.quiz_feedback
+        (st.success if fb["ok"] else st.warning)(fb["text"])
+
+        if st.button("➡️ Suivant", use_container_width=True, key=f"next_{q['id']}"):
+            st.session_state.quiz_feedback = None
+            st.session_state.quiz_locked = False
+            st.session_state.quiz_step += 1
+            if st.session_state.quiz_step >= total:
+                st.session_state.quiz_done = True
+            st.rerun()
+
+        # IMPORTANT : on stoppe ici pour ne pas ré-afficher les radios/boutons
+        return
+
+    if q["type"] == "QCF":
+        choice = st.radio("Réponse", q["choices"], key=f"quiz_{q['id']}")
+        if st.button("✅ Valider", use_container_width=True, key=f"btn_{q['id']}"):
+            st.session_state.quiz_answers[q["id"]] = choice
+
+            is_correct = (choice == q["correct"])
+            if is_correct:
+                st.session_state.quiz_score += 1
+
+            # on stocke l'explication (texte long) et on bloque
+            exp = q["ok"] if is_correct else q["ko"]
+            st.session_state.quiz_feedback = {"ok": is_correct, "text": exp}
+            st.session_state.quiz_locked = True
+            st.rerun()
+
+
+    elif q["type"] == "QFD":
+        choice = st.radio("Choisis la réponse qui te ressemble le plus", q["choices"], key=f"quiz_{q['id']}")
+        if st.button("✅ Valider", use_container_width=True, key=f"btn_{q['id']}"):
+            st.session_state.quiz_answers[q["id"]] = choice
+            exp = q["feedback"].get(choice, "OK")
+            st.session_state.quiz_feedback = {"ok": True, "text": exp}  # pas de vrai/faux ici
+            st.session_state.quiz_locked = True
+            st.rerun()
+
+    elif q["type"] == "ESG":
+        score = st.select_slider("Ta note ESG", options=q["scale"], value=3, key=f"quiz_{q['id']}")
+        if st.button("✅ Valider", use_container_width=True, key=f"btn_{q['id']}"):
+            st.session_state.quiz_answers[q["id"]] = score
+            exp = q["feedback"].get(score, "OK")
+            st.session_state.quiz_feedback = {"ok": True, "text": exp}
+            st.session_state.quiz_locked = True
+            st.rerun()
+
+    st.divider()
+    if st.button("↺ Recommencer le quiz", use_container_width=True):
+        st.session_state.quiz_step = 0
+        st.session_state.quiz_answers = {}
+        st.session_state.quiz_score = 0
+        st.session_state.quiz_done = False
+        st.session_state.quiz_announced = False
+        st.rerun()
 
 def render_desktop_chat():
     """Mode desktop avec 2 colonnes compactes."""
-    if st.session_state.get("mode_mobile", False):
-        st.subheader("💬 Conversation")
-        render_chat_core()
-        st.subheader("📊 Projection")
-        render_projection_panel()
-    else:
-        col_left, col_right = st.columns([1, 1], gap="small")
-        
-        with col_left:
-            st.subheader("💬 Conversation")
-            render_chat_core()
-        
-        with col_right:
-            st.subheader("📊 Projection")
-            render_projection_panel()
+    col_left, col_right = st.columns([1, 1])
 
+    with col_left:
+        render_chat_core()
+
+    st.caption(
+        f"DEBUG | slots_complete={st.session_state.get('slots_complete')} "
+        f"| quiz_done={st.session_state.get('quiz_done')} "
+        f"| reco_done={st.session_state.get('reco_done')}"
+    )
+    st.caption(
+        f"DEBUG client | objectif={bool(st.session_state.client.get('objectif'))} "
+        f"| horizon_annees={st.session_state.client.get('horizon_annees')} "
+        f"| horizon={st.session_state.client.get('horizon')} "
+        f"| mensualite={st.session_state.client.get('mensualite')} "
+        f"| risque={st.session_state.client.get('risque')}"
+    )
+
+    # 👉 MASQUAGE INTELLIGENT DE LA COLONNE DROITE
+    if st.session_state.get("slots_complete", False):
+
+        with col_right:
+
+            # 1) QUIZ
+            if not st.session_state.get("quiz_done", False):
+                render_quiz_gaming()
+
+            # 2) BOUTON RECO
+            elif not st.session_state.get("reco_done", False):
+                st.subheader("✅ Étape suivante")
+                st.success("Quiz terminé !")
+
+                if st.button("🧠 La recommandation de Francis", type="primary", use_container_width=True):
+                    generate_and_push_recommendation()
+                    st.rerun()
+
+            # 3) PROJECTION
+            else:
+                render_projection_panel()
 
 def render_chat_core():
     """Cœur du chat (réutilisable desktop/mobile)."""
@@ -436,6 +621,9 @@ def render_chat_core():
             "risque": None
         }
     
+    if "expected_slot" not in st.session_state:
+        st.session_state.expected_slot = None  # "objectif" | "horizon" | "mensualite" | "risque"
+    
     if "can_show_projection" not in st.session_state:
         st.session_state.can_show_projection = False
     
@@ -445,9 +633,35 @@ def render_chat_core():
     if "use_llm" not in st.session_state:
         st.session_state.use_llm = True
 
+    if "slots_complete" not in st.session_state:
+        st.session_state.slots_complete = False
+
+    if "reco_done" not in st.session_state:
+        st.session_state.reco_done = False
+    
+    if "reco_prompted" not in st.session_state:
+        st.session_state.reco_prompted = False
+
     if "generating" not in st.session_state:
         st.session_state.generating = False
     
+    if "quiz_feedback" not in st.session_state:
+        st.session_state.quiz_feedback = None  # dict {type, message, correct?}
+    if "quiz_locked" not in st.session_state:
+        st.session_state.quiz_locked = False   # bloque la question tant que l'utilisateur n'a pas cliqué "Suivant"
+    
+    # --- QUIZ state (Étape 1) ---
+    if "quiz_step" not in st.session_state:
+        st.session_state.quiz_step = 0  # 0..3
+    if "quiz_answers" not in st.session_state:
+        st.session_state.quiz_answers = {}
+    if "quiz_score" not in st.session_state:
+        st.session_state.quiz_score = 0
+    if "quiz_done" not in st.session_state:
+        st.session_state.quiz_done = False
+    if "quiz_announced" not in st.session_state:
+        st.session_state.quiz_announced = False
+        
     # Affichage des messages
     history_box = st.container(height=520, border=True)
     with history_box:
@@ -481,7 +695,7 @@ def render_chat_core():
     
     # Bouton reset
     if st.button("↺ Recommencer", key="btn_reset"):
-        for key in ["messages", "client", "can_show_projection", "show_projection", "risque_ui", "checkout_open", "checkout_step"]:
+        for key in [ "messages", "client", "can_show_projection", "show_projection", "risque_ui", "checkout_open", "checkout_step", "quiz_step", "quiz_answers", "quiz_score", "quiz_done", "quiz_announced"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
@@ -492,118 +706,156 @@ def render_chat_core():
         handle_user_input(user_text)
         st.rerun()
     
-
 def handle_user_input(user_text):
     """Traite l'entrée utilisateur: extraction, LLM, état."""
-    # Ajoute le message utilisateur
     st.session_state.messages.append({"role": "user", "content": user_text})
-    
+
     client = st.session_state.client
-    
-    # Extraction intelligente
+
+    # 1) Extraction
     extract_info_from_user_input(user_text, client)
+    missing = get_missing_slots(client)
 
-    # ✅ Détecte si toutes les infos sont remplies (utilise horizon_annees)
-    if all([client.get("objectif"), client.get("horizon_annees"), client.get("mensualite"), client.get("risque")]):
-        st.session_state.can_show_projection = True
+    # 2) Slots complets => débloque la colonne droite (quiz)
+    st.session_state.slots_complete = all([
+        client.get("objectif"),
+        client.get("horizon_annees"),
+        client.get("mensualite"),
+        client.get("risque"),
+    ])
 
-        # ✅ 1) Applique les règles de recommandation (code choisit)
-        recommended, alternatives, debug = recommend_products(
-            client=client,
-            project_text=client.get("objectif", ""),
-            catalog=PRODUCT_CATALOG,
-            top_k=3
-        )
+    # 3) Slots complets mais quiz PAS terminé => on bloque la reco
+    if st.session_state.slots_complete and not st.session_state.get("quiz_done", False):
+        if not st.session_state.get("quiz_announced", False):
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "🎮 Super, j’ai tout ce qu’il faut. Avant la recommandation, fais le mini‑quiz à droite 👉"
+            })
+            st.session_state.quiz_announced = True
+        return
 
-        # Stocke pour l’onglet "Règles"
-        st.session_state.reco = {
-            "recommended": recommended,
-            "alternatives": alternatives,
-            "debug": debug
-        }
+    # 4) Quiz terminé mais reco PAS encore déclenchée (par bouton à droite) => on guide
+    if st.session_state.slots_complete and st.session_state.get("quiz_done", False) and not st.session_state.get("reco_done", False):
+        if not st.session_state.get("reco_prompted", False):
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "✅ Quiz terminé ! Clique à droite sur **La recommandation de Francis** pour que je te propose la solution 👇"
+            })
+            st.session_state.reco_prompted = True
+        return
 
-        # Option : activer projection seulement si le produit supporte projection
-        if recommended and recommended.get("projection", {}).get("supports_VI_VP", False):
-            st.session_state.can_show_projection = True
-        else:
-            # si pas de projection (ex livret dans certains choix), tu peux décider autrement
-            st.session_state.can_show_projection = False
+    
+    # 5) Si slots PAS complets => on continue la conversation (LLM ou fallback)
+    if not st.session_state.slots_complete:
+        missing = get_missing_slots(client)
 
-    else:
-        # pas assez d'infos pour recommander
-        st.session_state.reco = None
+        # ✅ ÉTAPE 2 : on indique au système quel slot est attendu maintenant
+        st.session_state.expected_slot = missing[0] if missing else None
 
-    # ✅ 2) Build context (inclure la reco si disponible)
-    reco = st.session_state.get("reco")
-    reco_txt = ""
-    if reco and reco.get("recommended"):
-        reco_txt = f"""
-    Recommandation (calculée par les règles) :
-    - Produit recommandé : {reco['recommended']['name']} ({reco['recommended']['id']})
-    - Alternatives : {', '.join([p['name'] for p in (reco.get('alternatives') or [])]) or '—'}
-    - Debug goals : {reco['debug'].get('goals', []) if reco.get('debug') else '—'}
-    """
-
-    context = f"""
-    État client actuel :
+        context = f"""
+    État client :
     - Objectif : {client.get('objectif', 'Non défini')}
     - Horizon : {client.get('horizon', 'Non défini')} (horizon_annees={client.get('horizon_annees', 'Non défini')})
     - Mensualité : {client.get('mensualite', 'Non défini')} €
     - Risque : {client.get('risque', 'Non défini')}
 
-    Slots manquants : {', '.join(get_missing_slots(client)) or 'aucun'}
-
-    {reco_txt}
+    Slots manquants : {', '.join(missing) or 'aucun'}
 
     Règles :
-    - Si des infos manquent, pose UNE question à la fois.
-    - Si tout est défini, explique la recommandation (ne la change pas) et propose les prochaines étapes.
-"""
-    
-    # Choix du mode conversation
-    if st.session_state.get("use_llm", False):
+    - Pose UNE question à la fois sur le prochain slot manquant.
+    - Ne fais AUCUNE recommandation tant que les slots ne sont pas complets.
+    """
+
+        if st.session_state.get("use_llm", True):
+
+            st.session_state.generating = True
+            st.session_state.generation_context = context
+            return
+
+    # ✅ Mode post-recommandation : conversation libre
+    if st.session_state.get("reco_done", False):
+        # Contexte : produit reco + alternatives
+        reco = st.session_state.get("reco") or {}
+        recommended = reco.get("recommended") or {}
+        alternatives = reco.get("alternatives") or []
+        quiz = st.session_state.get("quiz_answers") or {}
+
+        context = f"""
+    Tu es Francis, conseiller épargne Banque Populaire.
+    Nous sommes en phase post‑recommandation : l’utilisateur pose des questions libres.
+    Réponds naturellement, sans guider par étapes, sans reposer les 4 questions.
+    Reste factuel et pédagogique. Si l’utilisateur conteste (ex: "PER bloqué"), explique et propose une alternative adaptée.
+    Ne promets jamais de rendement. Ne “ré-invente” pas de produits : utilise seulement {recommended.get('name')} et les alternatives si besoin.
+    Termine par : "Hypothèses illustratives — démonstrateur non contractuel."
+
+    Profil / contexte :
+    - Projet: {client.get('objectif')}
+    - Horizon: {client.get('horizon_annees')} ans
+    - Mensualité: {client.get('mensualite')} €
+    - Risque: {client.get('risque')}
+    - Produit recommandé: {recommended.get('name')} ({recommended.get('id')})
+    - Alternatives: {', '.join([p.get('name','') for p in alternatives]) or '—'}
+    - Quiz: {quiz}
+    """
+
+        # Déclenche la génération LLM (stream)
         st.session_state.generating = True
         st.session_state.generation_context = context
         return
-    else:
-        assistant_reply = None
 
-    if assistant_reply is None:
-        missing = get_missing_slots(client)
-        if "objectif" in missing:
-            assistant_reply = "Qu'est-ce que tu aimerais préparer grâce à ton épargne ?"
-        elif "horizon" in missing:
-            assistant_reply = "À quel horizon tu envisages cela ? (ex: 2 ans, 5 ans, 10 ans)"
-        elif "mensualite" in missing:
-            assistant_reply = "Quel montant peux-tu mettre de côté chaque mois ? (ex: 150€)"
-        elif "risque" in missing:
-            assistant_reply = "Quel est ton profil de risque ?\n- **Sécurisé** (faible risque)\n- **Équilibré** (risque modéré)\n- **Dynamique** (plus de risque)"
-        else:
-            assistant_reply = (
-                "✅ **Recommandation personnalisée**\n\n"
-                f"Je te recommande une **assurance vie** structurée autour d'un mix sécurisé et dynamique, adapté à ton âge ({KNOWN_PROFILE['age']} ans) et à ta capacité d'épargne.\n\n"
-                "📌 **Pourquoi ce choix ?**\n"
-                f"- Ton profil indique une situation stable en tant que {KNOWN_PROFILE['situation']}.\n"
-                f"- Tu disposes déjà de {KNOWN_PROFILE['livret_a']} € sur ton Livret A, ce qui montre que tu peux te permettre un placement plus structuré.\n"
-                "- Une assurance vie te permet de combiner **sécurité**, **flexibilité** et **potentiel de rendement**, tout en conservant un accès aux fonds.\n\n"
-                "💡 **Ce que cela t'apporte** :\n"
-                "- une protection adaptative en cas de besoin\n"
-                "- un capital investi sur du long terme avec un apport mensuel maîtrisé\n"
-                "- la possibilité de diversifier entre fonds en euros et unités de compte selon ton appétence au risque\n\n"
-                "🧭 **Prochaines étapes** :\n"
-                "- Valider ton objectif et ton horizon\n"
-                "- Confirmer ton montant mensuel\n"
-                "- Choisir le niveau de risque qui te convient\n\n"
-                "Clique sur **Voir la projection** pour visualiser l'évolution estimée."
-            )
-            st.session_state.can_show_projection = True
+    if assistant_reply:
+        st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
     
-    # Détection de recommandation
-    if "recommand" in assistant_reply.lower() or "assurance vie" in assistant_reply.lower():
-        st.session_state.can_show_projection = True
-    
-    # Enregistre la réponse assistant directement dans le flux de conversation
-    st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+def generate_and_push_recommendation():
+    """Calcule la recommandation et l’ajoute dans le chat (messages)."""
+    client = st.session_state.client
+
+    # 1) Choix produit via règles (code choisit)
+    recommended, alternatives, debug = recommend_products(
+        client=client,
+        project_text=client.get("objectif", ""),
+        catalog=PRODUCT_CATALOG,
+        top_k=3
+    )
+
+    st.session_state.reco = {
+        "recommended": recommended,
+        "alternatives": alternatives,
+        "debug": debug
+    }
+
+    # 2) Rédaction (LLM explique) — ou fallback
+    reco_context = {
+        "client": {
+            "objectif": client.get("objectif"),
+            "horizon_annees": client.get("horizon_annees"),
+            "mensualite": client.get("mensualite"),
+            "risque": client.get("risque"),
+        },
+        "quiz": st.session_state.get("quiz_answers", {}),
+        "recommended": recommended,
+        "alternatives": alternatives,
+    }
+
+    try:
+        text = call_llm(st.session_state.messages, f"RECO_CONTEXT={reco_context}")
+    except Exception:
+        # fallback si LLM indisponible
+        alt_txt = ", ".join([p["name"] for p in alternatives]) if alternatives else "—"
+        text = (
+            f"✅ **Recommandation** : {recommended['name']}\n\n"
+            f"- 📌 **Pourquoi** : cohérent avec ton horizon ({client.get('horizon_annees')} ans) et ton profil ({client.get('risque')}).\n"
+            f"- 🔁 **Alternatives** : {alt_txt}\n\n"
+            "🧭 Prochaine étape : clique sur **Afficher la projection**.\n\n"
+            "Hypothèses illustratives — démonstrateur non contractuel."
+        )
+
+    # 3) Push dans le chat
+    st.session_state.messages.append({"role": "assistant", "content": text})
+
+    # 4) Flags pour la suite UX
+    st.session_state.reco_done = True
+    st.session_state.can_show_projection = True
 
 def render_projection_panel():
     """Panel de projection."""
